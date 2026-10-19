@@ -497,6 +497,27 @@ def test_potential_lightning_loss_fn_allow_missing_labels():
     assert torch.allclose(out["Total_Loss"], torch.tensor(0.0), atol=1e-6)
 
 
+def test_potential_lightning_loss_fn_missing_charges():
+    """NaN charges (structures without charge labels) are skipped, including a batch with no charges at all."""
+    model = TensorNet(use_warp=False)
+    lit = PotentialLightningModule(model=model, stress_weight=0.0, charge_weight=1.0, allow_missing_labels=True)
+    energies, forces, stresses, _, num_atoms = _make_efs_batch()
+    n_atoms_total = forces.shape[0]
+    charges = torch.linspace(-0.5, 0.5, n_atoms_total)
+    preds = (energies.clone(), forces.clone(), stresses.clone(), charges + 0.1)
+
+    partial = charges.clone()
+    partial[2:5] = float("nan")  # structure index 1 has no charge labels
+    out = lit.loss_fn(loss=lit.loss, labels=(energies, forces, stresses, partial), preds=preds, num_atoms=num_atoms)
+    assert torch.isfinite(out["Total_Loss"])
+    assert torch.allclose(out["Charge_MAE"], torch.tensor(0.1), atol=1e-6)
+
+    missing = torch.full_like(charges, float("nan"))
+    out = lit.loss_fn(loss=lit.loss, labels=(energies, forces, stresses, missing), preds=preds, num_atoms=num_atoms)
+    assert torch.isfinite(out["Total_Loss"])
+    assert torch.allclose(out["Total_Loss"], torch.tensor(0.0), atol=1e-6)
+
+
 @pytest.mark.parametrize("magmom_target", ["absolute", "symbreak"])
 def test_potential_lightning_loss_fn_magmom_branches(magmom_target):
     """`magmom_weight > 0` enables calc_magmom and exercises both magmom_target branches."""
@@ -725,3 +746,34 @@ def test_xavier_init(distribution):
         print(w)
         assert not torch.allclose(w, model.linear.get_parameter("weight"))
         assert torch.allclose(torch.tensor(0.0), model.linear.get_parameter("bias"))
+
+
+def test_fit_element_refs_per_fidelity():
+    """With ``fidelities``, offsets are fitted separately per fidelity and stacked as (n_fidelity, n_elements)."""
+    elements = ("Li", "O")
+    lattice = Lattice.cubic(8.0)
+    species_lists = [["Li", "O"], ["Li", "Li", "O"], ["Li", "O", "O"], ["Li", "Li", "O", "O", "O"]]
+    structures = []
+    for specs in species_lists:
+        coords = np.linspace(0.05, 0.95, num=len(specs))[:, None].repeat(3, axis=1)
+        structures.append(Structure(lattice, specs, coords))
+    true_refs = np.array([[-2.0, -5.0], [-4.0, -9.0]])
+    structures = structures + structures
+    fidelities = [0] * 4 + [1] * 4
+    energies = [
+        sum(true_refs[f, elements.index(site.specie.symbol)] for site in s)
+        for s, f in zip(structures, fidelities, strict=True)
+    ]
+    refs = fit_element_refs(structures, energies, elements, fidelities=fidelities)
+    assert refs.shape == (2, len(elements))
+    np.testing.assert_allclose(refs, true_refs, atol=1e-8)
+
+    with pytest.raises(ValueError, match="fidelities"):
+        fit_element_refs(structures, energies, elements, fidelities=[0, 1])
+    with pytest.raises(ValueError, match="fidelity 1"):
+        fit_element_refs(structures[:4], energies[:4], elements, fidelities=[0, 0, 2, 2])
+
+    li_only = Structure(lattice, ["Li", "Li"], [[0, 0, 0], [0.5, 0.5, 0.5]])
+    with pytest.warns(UserWarning, match="Fidelity 1 has no structures containing \\['O'\\]"):
+        refs = fit_element_refs([*structures[:4], li_only], [*energies[:4], -8.0], elements, fidelities=[0] * 4 + [1])
+    assert refs[1, 1] == 0.0

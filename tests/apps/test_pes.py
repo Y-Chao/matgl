@@ -195,3 +195,29 @@ class TestPotential:
         ff.save(tmp_path)
         loaded = Potential.load(tmp_path)
         assert torch.allclose(loaded.element_refs.property_offset, ff.element_refs.property_offset)
+
+
+def test_potential_per_fidelity_element_refs_mixed_batch(MoS):
+    """2-D (n_fidelity, n_elements) element refs are applied per graph in a mixed-fidelity batch."""
+    torch.manual_seed(0)
+    element_types = ("Mo", "S")
+    model = TensorNet(
+        element_types=element_types,
+        is_intensive=False,
+        include_state=True,
+        ntypes_state=2,
+        dim_state_embedding=8,
+        use_warp=False,
+    )
+    refs = torch.tensor([[-5.0, -3.0], [-10.0, -6.0]], dtype=matgl.float_th)
+    ff = Potential(model=model, element_refs=refs)
+    ff_noref = Potential(model=model)
+    graph, lat, _ = Structure2Graph(element_types=element_types, cutoff=5.0).get_graph(MoS)
+    batch = Batch.from_data_list([graph, graph])
+    lats = torch.cat([lat, lat])
+    state = torch.tensor([0, 1])
+    e = ff(batch, lats, state)[0]
+    e_noref = ff_noref(batch, lats, state)[0]
+    counts = torch.tensor([float(MoS.composition[el]) for el in element_types], dtype=matgl.float_th)
+    assert e.shape == (2,)
+    assert torch.allclose(e - e_noref, refs @ counts, atol=1e-5)

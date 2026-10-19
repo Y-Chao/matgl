@@ -311,3 +311,24 @@ def test_warp_pyg_parity_pretrained(structure_fixture, request):
     assert torch.allclose(out_warp, out_pyg, atol=1e-5, rtol=1e-5), (
         f"{structure_fixture}: warp={out_warp.detach().cpu()} vs pyg={out_pyg.detach().cpu()}"
     )
+
+
+@pytest.mark.parametrize("is_intensive", [False, True])
+def test_model_multifidelity_state(graph_MoS, is_intensive):
+    """An integer state (e.g. data fidelity) conditions the output; state features are exposed in feature_dict."""
+    torch.manual_seed(0)
+    _, graph, _ = graph_MoS
+    model = TensorNet(
+        is_intensive=is_intensive, include_state=True, ntypes_state=3, dim_state_embedding=8, use_warp=False
+    )
+    outs = [model(g=graph, state_attr=torch.tensor([s])) for s in range(3)]
+    assert not torch.allclose(outs[0], outs[1])
+    assert not torch.allclose(outs[1], outs[2])
+    assert model.feature_dict["state_feat"].shape == (1, 8)
+
+
+def test_model_multifidelity_state_disables_warp():
+    model = TensorNet(include_state=True, ntypes_state=2, dim_state_embedding=8)
+    assert model._use_warp is False
+    with pytest.raises(ValueError, match="warp"):
+        TensorNet(include_state=True, ntypes_state=2, dim_state_embedding=8, use_warp=True)

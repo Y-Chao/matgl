@@ -264,3 +264,19 @@ def test_virials_match_stress_volume(tiny_potential, mo_s_supercell):
 
     diff = (out["virials"].detach() - expected_virial).abs().max().item()
     assert diff < 1e-3, f"virial mismatch (max abs diff = {diff})"
+
+
+def test_rejects_state_conditioned_model():
+    """A multi-fidelity (include_state=True) model must not be exported with its state silently dropped."""
+    model = TensorNet(
+        element_types=("Mo", "S"),
+        is_intensive=False,
+        use_smooth=True,
+        rbf_type="SphericalBessel",
+        include_state=True,
+        ntypes_state=2,
+        dim_state_embedding=8,
+        use_warp=False,
+    )
+    with pytest.raises(ValueError, match="include_state"):
+        LAMMPSMatGLModel(potential=Potential(model=model))
