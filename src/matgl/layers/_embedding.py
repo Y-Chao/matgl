@@ -12,6 +12,7 @@ from torch import nn
 
 import matgl
 from matgl.layers._core import MLP
+from matgl.layers._graph_convolution import _broadcast_to_nodes
 from matgl.utils.cutoff import cosine_cutoff
 from matgl.utils.maths import (
     new_radial_tensor,
@@ -133,6 +134,7 @@ class TensorEmbedding(nn.Module):
         ntypes_node: int,
         cutoff: float,
         dtype: torch.dtype = matgl.float_th,
+        dim_state_feats: int = 0,
     ):
         """Initialize the TensorEmbedding.
 
@@ -143,22 +145,26 @@ class TensorEmbedding(nn.Module):
             ntypes_node (int): Number of node labels.
             cutoff (float): Cutoff radius for graph construction.
             dtype (torch.dtype): Data type for all variables.
+            dim_state_feats (int): Width of the (already embedded) global state features. When > 0, the state is
+                concatenated into both the edge scalar ``Zij`` and the node scalar update, so the initial tensor
+                representation is conditioned on the state (e.g. data fidelity). 0 disables state conditioning.
         """
         super().__init__()
         self.units = units
         self.cutoff = cutoff
+        self.dim_state_feats = dim_state_feats
 
         # Initialize layers
         self.distance_proj1 = nn.Linear(degree_rbf, units, dtype=dtype)
         self.distance_proj2 = nn.Linear(degree_rbf, units, dtype=dtype)
         self.distance_proj3 = nn.Linear(degree_rbf, units, dtype=dtype)
         self.emb = nn.Embedding(ntypes_node, units, dtype=dtype)
-        self.emb2 = nn.Linear(2 * units, units, dtype=dtype)
+        self.emb2 = nn.Linear(2 * units + dim_state_feats, units, dtype=dtype)
         self.act = activation
         self.linears_tensor = nn.ModuleList([nn.Linear(units, units, bias=False, dtype=dtype) for _ in range(3)])
         self.linears_scalar = nn.ModuleList(
             [
-                nn.Linear(units, 2 * units, bias=True, dtype=dtype),
+                nn.Linear(units + dim_state_feats, 2 * units, bias=True, dtype=dtype),
                 nn.Linear(2 * units, 3 * units, bias=True, dtype=dtype),
             ]
         )
@@ -188,12 +194,13 @@ class TensorEmbedding(nn.Module):
         Iij: torch.Tensor,
         Aij: torch.Tensor,
         Sij: torch.Tensor,
+        state_edge: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Message function for edge updates."""
         vi = x_i  # Source node features
         vj = x_j  # Destination node features
         # Concatenate node and state features
-        zij = torch.cat([vi, vj], dim=-1)
+        zij = torch.cat([vi, vj] if state_edge is None else [vi, vj, state_edge], dim=-1)
         Zij = self.emb2(zij)
         scalars = Zij[..., None, None] * Iij
         skew_matrices = Zij[..., None, None] * Aij
@@ -221,6 +228,7 @@ class TensorEmbedding(nn.Module):
         edge_weight: torch.Tensor,
         edge_vec: torch.Tensor,
         state_attr: torch.Tensor | None = None,
+        batch: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Compute embedded node tensors and (optional) state features.
 
@@ -235,20 +243,28 @@ class TensorEmbedding(nn.Module):
                 Shape: (num_edges,) or (num_edges, 1).
             edge_vec (torch.Tensor): Edge direction vectors from source to target nodes.
                 Shape: (num_edges, 3).
-            state_attr (torch.Tensor, optional): Global (graph-level) state attributes shared by all nodes
-                (e.g. external conditions or control parameters). Shape: (num_graphs, state_dim).
+            state_attr (torch.Tensor, optional): Embedded global (graph-level) state features shared by all nodes
+                of a graph (e.g. a learned fidelity embedding). Shape: (num_graphs, dim_state_feats). Only used
+                when the layer was built with ``dim_state_feats > 0``.
+            batch (torch.Tensor, optional): Graph index of each node, shape (num_nodes,). ``None`` for a single
+                graph.
 
         Returns:
             x (torch.Tensor): Updated node representations after message passing.
                 Shape: (num_nodes, hidden_channels).
-            state_feat (torch.Tensor): Updated global state features.
-                Shape: (num_graphs, state_hidden_channels).
+            state_feat (torch.Tensor): The state features passed in (unchanged), or ``None``.
+                Shape: (num_graphs, dim_state_feats).
         """
         # Node embedding
         x = self.emb(z)  # Assuming node_type is integer for embedding
 
-        # set dummy state features for now and nothing to do for state_attr
-        state_feat = None
+        state_feat = state_attr if self.dim_state_feats > 0 else None
+        # Explicit Optional annotations keep this method TorchScript-compatible (LAMMPS export).
+        state_node: torch.Tensor | None = None
+        state_edge: torch.Tensor | None = None
+        if state_feat is not None:
+            state_node = _broadcast_to_nodes(state_feat, batch, x.size(0))
+            state_edge = state_node[edge_index[0]]
 
         # Edge processing
         C = cosine_cutoff(edge_weight, self.cutoff)
@@ -276,6 +292,7 @@ class TensorEmbedding(nn.Module):
             Iij=Iij,
             Aij=Aij,
             Sij=Sij,
+            state_edge=state_edge,
         )
 
         scalars, skew_matrices, traceless_tensors = self.aggregate(msg, edge_index[0], dim_size=x.size(0))
@@ -283,6 +300,8 @@ class TensorEmbedding(nn.Module):
         # Node update
         norm = tensor_norm(scalars + skew_matrices + traceless_tensors)
         norm = self.init_norm(norm)
+        if state_node is not None:
+            norm = torch.cat([norm, state_node], dim=-1)
         scalars = self.linears_tensor[0](scalars.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         skew_matrices = self.linears_tensor[1](skew_matrices.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         traceless_tensors = self.linears_tensor[2](traceless_tensors.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)

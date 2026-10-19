@@ -30,7 +30,7 @@ from matgl.layers._readout_torch import (
     WeightedAtomReadOut,
     WeightedReadOut,
 )
-from matgl.utils.maths import decompose_tensor, scatter_add, tensor_norm
+from matgl.utils.maths import decompose_tensor, scatter_add, scatter_mean, tensor_norm
 
 from ._core import MatGLModel, _warn_feature_dict_kwarg
 
@@ -90,10 +90,16 @@ class TensorNet(MatGLModel):
             element_types (tuple): List of elements appearing in the dataset. Default to DEFAULT_ELEMENTS.
             units (int, optional): Hidden embedding size.
                 (default: :obj:`64`)
-            ntypes_state (int): Number of state labels
-            dim_state_embedding (int): Number of hidden neurons in state embedding
-            dim_state_feats (int): Number of state features after linear layer
-            include_state (bool): Whether to include states features
+            ntypes_state (int): Number of integer state labels, e.g. the number of data fidelities (PBE: 0,
+                r2SCAN: 1) for multi-fidelity training (Ko & Ong, npj Comput. Mater. 11, 65 (2025)).
+            dim_state_embedding (int): Width of the learned state embedding.
+            dim_state_feats (int): Unused; kept for config compatibility. Only integer (categorical) states are
+                supported.
+            include_state (bool): Whether to condition the model on a per-graph integer state. Requires
+                ``ntypes_state`` and ``dim_state_embedding > 0``. The embedded state enters the tensor embedding
+                and every interaction block, and is updated from the node features between blocks. Forward
+                calls must then pass ``state_attr`` with one label per graph. Uses the PyG kernels (warp kernels
+                do not support state).
             nblocks (int, optional): The number of interaction layers.
                 (default: :obj:`2`)
             num_rbf (int, optional): The number of radial basis Gaussian functions :math:`\mu`.
@@ -133,12 +139,21 @@ class TensorNet(MatGLModel):
                 f"Invalid activation type, please try using one of {[af.name for af in ActivationFunction]}"
             ) from None
 
+        if include_state:
+            if not ntypes_state or not dim_state_embedding:
+                raise ValueError(
+                    "include_state=True requires ntypes_state (number of state labels, e.g. fidelities) and "
+                    f"dim_state_embedding > 0; got ntypes_state={ntypes_state}, "
+                    f"dim_state_embedding={dim_state_embedding}."
+                )
+            if use_warp:
+                raise ValueError("include_state=True is not supported by the warp kernels; pass use_warp=False.")
         if use_warp and not _warp_available:
             raise ImportError(
                 "use_warp=True but nvalchemi-toolkit-ops is not installed. "
                 "Install it or pass use_warp=False to use the plain PyG backend."
             )
-        self._use_warp = _warp_available if use_warp is None else use_warp
+        self._use_warp = (_warp_available if use_warp is None else use_warp) and not include_state
 
         self.element_types = element_types  # type: ignore
 
@@ -179,6 +194,8 @@ class TensorNet(MatGLModel):
         EmbeddingCls = TensorEmbeddingWarp if self._use_warp else TensorEmbeddingPyG  # type: ignore[assignment]
         InteractionCls = TensorNetInteractionWarp if self._use_warp else TensorNetInteractionPyG  # type: ignore[assignment]
 
+        # Only the PyG layers take ``dim_state_feats``; passing it unconditionally would break the warp layers.
+        state_kwargs = {"dim_state_feats": dim_state_embedding} if include_state else {}
         self.tensor_embedding = EmbeddingCls(
             units=units,
             degree_rbf=num_rbf,
@@ -186,12 +203,31 @@ class TensorNet(MatGLModel):
             ntypes_node=len(element_types),
             cutoff=cutoff,
             dtype=dtype,
+            **state_kwargs,
         )
 
         self.layers = nn.ModuleList(
-            InteractionCls(num_rbf, units, activation, cutoff, equivariance_invariance_group, dtype)
+            InteractionCls(num_rbf, units, activation, cutoff, equivariance_invariance_group, dtype, **state_kwargs)
             for _ in range(nblocks)
         )
+
+        # M3GNet-style global state: a learned embedding of the integer label, updated between interaction blocks
+        # from the per-graph mean of the rotation-invariant node norms. The readout uses atomic features only (as in
+        # Ko & Ong 2025), so no update follows the last block -- it would be dead parameters (and break DDP).
+        self.state_embedding: nn.Embedding | None = None
+        self.state_updates: nn.ModuleList | None = None
+        if include_state:
+            self.state_embedding = nn.Embedding(ntypes_state, dim_state_embedding, dtype=dtype)  # type: ignore[arg-type]
+            self.state_updates = nn.ModuleList(
+                nn.Sequential(
+                    nn.Linear(units + dim_state_embedding, units, dtype=dtype),
+                    activation,
+                    nn.Linear(units, dim_state_embedding, dtype=dtype),
+                )
+                for _ in range(nblocks - 1)
+            )
+            if nblocks > 1:
+                self.state_node_norm = nn.LayerNorm(units, dtype=dtype)
 
         self.out_norm = nn.LayerNorm(3 * units, dtype=dtype)
         self.linear = nn.Linear(3 * units, units, dtype=dtype)
@@ -246,6 +282,32 @@ class TensorNet(MatGLModel):
         for layer in self.layers:
             layer.reset_parameters()
         self.out_norm.reset_parameters()
+
+    def _embed_state(self, g: Any, state_attr: torch.Tensor | None) -> torch.Tensor:
+        """Embed one integer state label per graph into ``(num_graphs, dim_state_embedding)``."""
+        batch = getattr(g, "batch", None)
+        num_graphs = 1 if batch is None else int(getattr(g, "num_graphs", None) or int(batch.max()) + 1)
+        if state_attr is None:
+            raise ValueError(
+                "include_state=True requires state_attr with one integer label per graph (e.g. the fidelity)."
+            )
+        labels = torch.as_tensor(state_attr, device=g.pos.device).reshape(-1)
+        if labels.numel() != num_graphs:
+            raise ValueError(
+                f"state_attr must hold one integer label per graph: got {labels.numel()} values for {num_graphs} "
+                "graph(s). Note that the graph converter's default state ([0.0, 0.0]) is not a valid label; pass "
+                "the fidelity explicitly, e.g. state_attr=torch.tensor([1])."
+            )
+        return self.state_embedding(labels.long())  # type: ignore[misc]
+
+    def _update_state(self, X: torch.Tensor, state_feat: torch.Tensor, batch: torch.Tensor | None, i: int):
+        """Residual M3GNet-style state update from the per-graph mean of invariant node norms."""
+        node_inv = self.state_node_norm(tensor_norm(X))
+        if batch is None:
+            pooled = node_inv.mean(dim=0, keepdim=True)
+        else:
+            pooled = scatter_mean(node_inv, batch.to(torch.long), dim_size=state_feat.size(0), dim=0)
+        return state_feat + self.state_updates[i](torch.cat([state_feat, pooled], dim=-1))  # type: ignore[index]
 
     def forward_features(
         self,
@@ -305,11 +367,17 @@ class TensorNet(MatGLModel):
                 fea_dict[f"gc_{i + 1}"] = X
             x = fn_tensor_norm3(X)  # type: ignore[name-defined]
         else:
-            X, _ = self.tensor_embedding(z, edge_index, edge_attr, bond_dist, bond_vec, state_attr)
+            batch = getattr(g, "batch", None)
+            state_feat = self._embed_state(g, state_attr) if self.include_state else None
+            X, _ = self.tensor_embedding(z, edge_index, edge_attr, bond_dist, bond_vec, state_feat, batch)
             fea_dict["embedding"] = X
             for i, layer in enumerate(self.layers):
-                X = layer(edge_index, bond_dist, edge_attr, X)
+                X = layer(edge_index, bond_dist, edge_attr, X, state_feat, batch)
                 fea_dict[f"gc_{i + 1}"] = X
+                if state_feat is not None and i < len(self.layers) - 1:
+                    state_feat = self._update_state(X, state_feat, batch, i)
+            if state_feat is not None:
+                fea_dict["state_feat"] = state_feat
             scalars, skew_metrices, traceless_tensors = decompose_tensor(X)
             x = torch.cat((tensor_norm(scalars), tensor_norm(skew_metrices), tensor_norm(traceless_tensors)), dim=-1)
 

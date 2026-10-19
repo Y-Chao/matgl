@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -669,10 +670,12 @@ class PotentialLightningModule(MatglLightningModuleMixin, pl.LightningModule):
                 m_rmse = self.rmse(labels_3, valid_preds[3])
             total_loss = total_loss + self.magmom_weight * m_loss
 
-        if self.model.calc_charge:
-            q_loss = loss(labels[3], preds[3])
-            q_mae = self.mae(labels[3], preds[3])
-            q_rmse = self.rmse(labels[3], preds[3])
+        # Use the NaN-masked tensors so structures without charge labels are skipped; a batch with no charge
+        # labels at all contributes nothing (an empty loss would otherwise be NaN).
+        if self.model.calc_charge and valid_labels[3].numel() > 0:
+            q_loss = loss(valid_labels[3], valid_preds[3], **self.loss_params)
+            q_mae = self.mae(valid_labels[3], valid_preds[3])
+            q_rmse = self.rmse(valid_labels[3], valid_preds[3])
             total_loss = total_loss + self.charge_weight * q_loss
 
         return {
@@ -695,6 +698,7 @@ def fit_element_refs(
     energies: ArrayLike,
     element_types: Sequence[str],
     *,
+    fidelities: ArrayLike | None = None,
     rcond: float | None = None,
 ) -> np.ndarray:
     r"""Fit per-element energy offsets via linear regression.
@@ -728,6 +732,14 @@ def fit_element_refs(
             the value of ``model.element_types`` or what
             ``matgl.ext.pymatgen.get_element_list`` returns. The output
             offset vector is in this order.
+        fidelities: Optional integer fidelity label per structure (e.g.
+            PBE: 0, r2SCAN: 1), matching the ``graph_labels`` used for a
+            multi-fidelity model. Absolute energies of different
+            functionals differ by several eV/atom, so the offsets are
+            then fitted separately for each fidelity and stacked into a
+            ``(n_fidelities, len(element_types))`` array, which
+            :class:`matgl.apps.pes.Potential` indexes per graph by
+            ``state_attr``.
         rcond: Forwarded to ``numpy.linalg.lstsq``. ``None`` (default)
             uses NumPy's current default cutoff for small singular
             values; pass ``-1`` to retain old behaviour, or a float to
@@ -735,12 +747,15 @@ def fit_element_refs(
 
     Returns:
         ``np.ndarray`` of shape ``(len(element_types),)`` with the fitted
-        per-element offsets, dtype ``float64``.
+        per-element offsets, dtype ``float64``; shape
+        ``(max(fidelities) + 1, len(element_types))`` when ``fidelities``
+        is given.
 
     Raises:
-        ValueError: If ``structures`` and ``energies`` have different
-            lengths, or if a structure contains an element not listed in
-            ``element_types``.
+        ValueError: If ``structures`` and ``energies`` (or ``fidelities``)
+            have different lengths, if a structure contains an element
+            not listed in ``element_types``, or if a fidelity label in
+            ``range(max(fidelities) + 1)`` has no structures.
 
     Note:
         For inputs already in graph form (e.g. an
@@ -780,8 +795,26 @@ def fit_element_refs(
                 )
             counts[i, col] += 1.0
 
-    refs, *_ = np.linalg.lstsq(counts, energies_arr, rcond=rcond)
-    return refs
+    if fidelities is None:
+        refs, *_ = np.linalg.lstsq(counts, energies_arr, rcond=rcond)
+        return refs
+
+    fid_arr = np.asarray(fidelities).reshape(-1).astype(int)
+    if fid_arr.shape[0] != energies_arr.shape[0]:
+        raise ValueError(f"len(fidelities)={fid_arr.shape[0]} does not match len(energies)={energies_arr.shape[0]}.")
+    rows = []
+    for fid in range(int(fid_arr.max()) + 1):
+        mask = fid_arr == fid
+        if not mask.any():
+            raise ValueError(f"No structures with fidelity {fid}; fidelity labels must be 0..n_fidelities-1.")
+        missing = [el for el, n in zip(element_types, counts[mask].sum(axis=0), strict=True) if n == 0]
+        if missing:
+            warnings.warn(
+                f"Fidelity {fid} has no structures containing {missing}; their offsets are set to 0.", stacklevel=2
+            )
+        refs, *_ = np.linalg.lstsq(counts[mask], energies_arr[mask], rcond=rcond)
+        rows.append(refs)
+    return np.stack(rows)
 
 
 def xavier_init(model: nn.Module, gain: float = 1.0, distribution: Literal["uniform", "normal"] = "uniform") -> None:
@@ -1033,8 +1066,6 @@ def _matpes_samples_to_lists(
     if has_stress:
         labels["stresses"] = stresses
     if dropped and enabled:
-        import warnings
-
         missing = ", ".join(f"{label}({src})" for label, src, _ in enabled)
         warnings.warn(
             f"Dropped {dropped} MatPES samples missing one of: {missing}.",

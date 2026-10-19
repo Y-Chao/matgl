@@ -93,7 +93,9 @@ class Potential(nn.Module, IOMixIn):
             model: Model for predicting energies.
             data_mean: Mean of target.
             data_std: Std dev of target.
-            element_refs: Element reference values for each element.
+            element_refs: Element reference values for each element, shape ``(n_elements,)``, or
+                ``(n_states, n_elements)`` for per-fidelity references, in which case the row is picked per graph
+                from the integer ``state_attr`` passed to ``forward``.
             calc_forces: Enable force calculations.
             calc_stresses: Enable stress calculations.
             calc_hessian: Enable hessian calculations.
@@ -310,7 +312,7 @@ class Potential(nn.Module, IOMixIn):
                 total_energies += self.repuls(self.model.element_types, g)  # type: ignore[attr-defined]
 
             if self.element_refs is not None:
-                property_offset = torch.squeeze(self.element_refs(g))
+                property_offset = torch.squeeze(self.element_refs(g, state_attr))
                 total_energies += property_offset
 
         forces = torch.zeros(1)

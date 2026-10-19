@@ -70,20 +70,28 @@ class AtomRef(nn.Module):
 
         Args:
             g: a batch of PyG graphs (torch_geometric.data.Data)
-            state_attr: state attributes
+            state_attr: state attributes. Required for multi-state (2-D) offsets, where it holds one integer
+                label per graph (e.g. the data fidelity) selecting the row of ``property_offset``.
 
         Returns:
-            offset_per_graph
+            offset_per_graph, shape (B,)
         """
         # Gather per-atom offsets directly: shape (N,) or (S, N) for multi-state refs.
         # This replaces the previous (N, max_z) one-hot * repeat * multiply * sum pipeline,
         # which allocated max_z times the memory and FLOPs for the same result.
         batch = getattr(g, "batch", None)
         if self.property_offset.ndim > 1:
-            # Multi-state: (S, max_z) -> per-atom (S, N) -> per-graph (S, B)
+            # Multi-state: (S, max_z) -> per-atom (S, N) -> per-graph (S, B) -> row state[b] of column b.
             atomic_offset = self.property_offset[:, g.node_type]  # (S, N)
             offset_per_graph = global_add_pool(atomic_offset.T, batch).T  # (S, B)
-            return offset_per_graph[state_attr] if state_attr is not None else offset_per_graph
+            num_graphs = offset_per_graph.shape[1]
+            if state_attr is None or torch.as_tensor(state_attr).numel() != num_graphs:
+                raise ValueError(
+                    "Multi-state element refs require state_attr with one integer label per graph "
+                    f"({num_graphs} graph(s)); got {None if state_attr is None else tuple(state_attr.shape)}."
+                )
+            labels = torch.as_tensor(state_attr, device=offset_per_graph.device).reshape(-1).long()
+            return offset_per_graph[labels, torch.arange(num_graphs, device=labels.device)]
 
         atomic_offset = self.property_offset[g.node_type]  # (N,)
         return global_add_pool(atomic_offset, batch)  # (B,)

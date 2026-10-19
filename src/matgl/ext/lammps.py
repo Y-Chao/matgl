@@ -384,6 +384,15 @@ class LAMMPSMatGLModel(nn.Module):
                 "SO3Net/QET are not yet exported."
             )
 
+        if getattr(model, "include_state", False):
+            # The kernels run the layers without a global state; exporting a
+            # state-conditioned (e.g. multi-fidelity) model would silently drop it.
+            raise ValueError(
+                f"Inner {type(model).__name__} has include_state=True (e.g. a "
+                "multi-fidelity model); LAMMPS export of state-conditioned models "
+                "is not supported."
+            )
+
         if model.is_intensive:
             raise ValueError(
                 f"Inner {type(model).__name__} has is_intensive=True. "
