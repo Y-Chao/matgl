@@ -172,6 +172,15 @@ class TensorEmbedding(nn.Module):
 
         self.reset_parameters()
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Handle checkpoints saved by the warp layer, which fuses distance_proj1/2/3 into one distance_proj."""
+        for suffix in ("weight", "bias"):
+            fused = state_dict.pop(f"{prefix}distance_proj.{suffix}", None)
+            if fused is not None:
+                for i, chunk in enumerate(fused.chunk(3, dim=0), start=1):
+                    state_dict[f"{prefix}distance_proj{i}.{suffix}"] = chunk
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def reset_parameters(self):
         """Reinitialize the parameters."""
         self.distance_proj1.reset_parameters()

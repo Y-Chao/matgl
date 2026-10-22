@@ -331,3 +331,18 @@ def test_model_multifidelity_state_keeps_warp_default():
     """State conditioning no longer forces the PyG fallback; the backend default is unchanged."""
     model = TensorNet(include_state=True, ntypes_state=2, dim_state_embedding=8)
     assert model._use_warp is _warp_available
+
+
+def test_pyg_loads_fused_warp_distance_proj(graph_MoS):
+    """The PyG embedding accepts the warp layer's fused distance_proj (checkpoints trained with warp)."""
+    _, graph, _ = graph_MoS
+    torch.manual_seed(0)
+    model = TensorNet(element_types=["Mo", "S"], is_intensive=False, use_warp=False)
+    state = model.state_dict()
+    prefix = "tensor_embedding.distance_proj"
+    for suffix in ("weight", "bias"):
+        state[f"{prefix}.{suffix}"] = torch.cat([state.pop(f"{prefix}{i}.{suffix}") for i in (1, 2, 3)])
+    torch.manual_seed(1)
+    other = TensorNet(element_types=["Mo", "S"], is_intensive=False, use_warp=False)
+    other.load_state_dict(state)
+    assert torch.allclose(other(g=graph), model(g=graph))

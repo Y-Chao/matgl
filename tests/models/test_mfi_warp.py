@@ -216,12 +216,26 @@ def test_warp_save_load_roundtrip(structure, tmp_path):
     assert torch.allclose(loaded(g=g, state_attr=state), ref, atol=1e-6)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known gap: the PyG TensorEmbedding cannot load the warp layer's fused distance_proj weights, so a "
-    "warp-trained checkpoint does not load on a machine without warp (or for LAMMPS export).",
-)
-def test_warp_checkpoint_loads_into_pyg():
-    _, model_warp = _pyg_warp_pair()
-    model_pyg = TensorNet(element_types=ELEMENTS, use_warp=False, **MFI_KWARGS)
+def test_warp_checkpoint_loads_on_pyg(structure, tmp_path, monkeypatch):
+    """A model trained on warp (use_warp left at the default) reloads on a machine without warp and gives the
+    same predictions. IOMixIn.load uses strict=False, so a missing key conversion would silently keep random
+    distance_proj weights rather than fail."""
+    import matgl.models._tensornet as tensornet_module
+
+    torch.manual_seed(0)
+    model_warp = QET(element_types=ELEMENTS, **MFI_KWARGS)  # use_warp=None -> warp when available
+    assert model_warp._use_warp
+    _randomize_state_params(model_warp)
+    g, _ = _batch(structure)
+    state = torch.tensor([0, 1], device=DEVICE)
+    ref = model_warp.to(DEVICE)(g=g, state_attr=state)
+    model_warp.cpu().save(tmp_path)
+
+    monkeypatch.setattr(tensornet_module, "_warp_available", False)
+    loaded = QET.load(tmp_path).to(DEVICE)
+    assert not loaded._use_warp
+    assert torch.allclose(loaded(g=g, state_attr=state), ref, atol=1e-5, rtol=1e-4)
+
+    # Strict loading of the fused warp state dict into PyG layers works too.
+    model_pyg = QET(element_types=ELEMENTS, use_warp=False, **MFI_KWARGS)
     model_pyg.load_state_dict(model_warp.state_dict())
