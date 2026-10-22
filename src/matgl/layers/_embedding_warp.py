@@ -16,6 +16,7 @@ import torch
 from torch import nn
 
 import matgl
+from matgl.layers._graph_convolution import _broadcast_to_nodes
 from matgl.ops import fn_compose_tensor, fn_radial_message_passing
 from matgl.utils.cutoff import cosine_cutoff
 
@@ -36,21 +37,25 @@ class TensorEmbedding(nn.Module):
         ntypes_node: int,
         cutoff: float,
         dtype: torch.dtype = matgl.float_th,
+        dim_state_feats: int = 0,
     ):
         super().__init__()
         self.units = units
         self.cutoff = cutoff
+        # Same state conditioning (and parameter shapes) as the PyG TensorEmbedding, applied in PyTorch around the
+        # warp kernels, so checkpoints are interchangeable between the two backends.
+        self.dim_state_feats = dim_state_feats
 
         # Create unified distance_proj from 3 temp layers (matches reference RNG pattern).
         self.distance_proj = self._create_distance_proj(degree_rbf, units, dtype=dtype)
 
         self.emb = nn.Embedding(ntypes_node, units, dtype=dtype)
-        self.emb2 = nn.Linear(2 * units, units, dtype=dtype)
+        self.emb2 = nn.Linear(2 * units + dim_state_feats, units, dtype=dtype)
         self.act = activation
         self.linears_tensor = nn.ModuleList([nn.Linear(units, units, bias=False, dtype=dtype) for _ in range(3)])
         self.linears_scalar = nn.ModuleList(
             [
-                nn.Linear(units, 2 * units, bias=True, dtype=dtype),
+                nn.Linear(units + dim_state_feats, 2 * units, bias=True, dtype=dtype),
                 nn.Linear(2 * units, 3 * units, bias=True, dtype=dtype),
             ]
         )
@@ -127,6 +132,8 @@ class TensorEmbedding(nn.Module):
         edge_attr: torch.Tensor,
         row_data: torch.Tensor,
         row_indptr: torch.Tensor,
+        state_feat: torch.Tensor | None = None,
+        batch: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -138,16 +145,25 @@ class TensorEmbedding(nn.Module):
             edge_attr: Edge attributes (RBF), shape (num_edges, num_rbf)
             row_data: CSR row data for source aggregation, shape (num_edges,)
             row_indptr: CSR row indptr for source aggregation, shape (num_nodes+1,)
+            state_feat: Embedded global state features, shape (num_graphs, dim_state_feats). Only used when the
+                layer was built with ``dim_state_feats > 0``.
+            batch: Graph index of each node, shape (num_nodes,). ``None`` for a single graph.
 
         Returns:
             X: Tensor representation, shape (num_nodes, 3, 3, units)
         """
         x = self.emb(z)  # (num_nodes, units)
 
+        state_node: torch.Tensor | None = None
+        if self.dim_state_feats > 0 and state_feat is not None:
+            state_node = _broadcast_to_nodes(state_feat, batch, x.size(0))
+
         C = cosine_cutoff(edge_weight, self.cutoff)
         edge_attr = self.distance_proj(edge_attr).view(-1, 3, self.units)
 
         zij = x.index_select(0, edge_index.t().reshape(-1)).view(-1, self.units * 2)
+        if state_node is not None:
+            zij = torch.cat([zij, state_node[edge_index[0]]], dim=-1)
         Zij = self.emb2(zij)  # (num_edges, units)
 
         edge_attr_processed = edge_attr.view(-1, 3, self.units) * C.view(-1, 1, 1) * Zij.view(-1, 1, self.units)
@@ -159,6 +175,8 @@ class TensorEmbedding(nn.Module):
 
         norm = _tensor_norm(X)  # (num_nodes, units)
         norm = self.init_norm(norm)
+        if state_node is not None:
+            norm = torch.cat([norm, state_node], dim=-1)
 
         for linear_scalar in self.linears_scalar:
             norm = self.act(linear_scalar(norm))

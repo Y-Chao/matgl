@@ -14,6 +14,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from matgl.layers._graph_convolution import _broadcast_to_nodes
 from matgl.ops import (
     fn_compose_tensor,
     fn_decompose_tensor,
@@ -40,21 +41,26 @@ class TensorNetInteraction(nn.Module):
         cutoff: float,
         equivariance_invariance_group: str,
         dtype: torch.dtype = torch.float32,
+        dim_state_feats: int = 0,
     ):
         super().__init__()
         self.num_rbf = num_rbf
         self.units = units
         self.cutoff = cutoff
         self.equivariance_invariance_group = equivariance_invariance_group
+        # Same state conditioning (and parameter shapes) as the PyG TensorNetInteraction, applied in PyTorch around
+        # the warp kernels: state concatenated into the edge scalar MLP, plus a FiLM scale on the node update.
+        self.dim_state_feats = dim_state_feats
 
         self.linears_scalar = nn.ModuleList(
             [
-                nn.Linear(num_rbf, units, bias=True, dtype=dtype),
+                nn.Linear(num_rbf + dim_state_feats, units, bias=True, dtype=dtype),
                 nn.Linear(units, 2 * units, bias=True, dtype=dtype),
                 nn.Linear(2 * units, 3 * units, bias=True, dtype=dtype),
             ]
         )
         self.linears_tensor = nn.ModuleList([nn.Linear(units, units, bias=False, dtype=dtype) for _ in range(6)])
+        self.state_film = nn.Linear(dim_state_feats, units, dtype=dtype) if dim_state_feats > 0 else None
         self.act = activation
         self.reset_parameters()
 
@@ -65,6 +71,10 @@ class TensorNetInteraction(nn.Module):
                 nn.init.zeros_(linear.bias)
         for linear in self.linears_tensor:
             nn.init.xavier_uniform_(linear.weight)
+        if self.state_film is not None:
+            # Start from an identity modulation; the scale is learned from the data.
+            nn.init.zeros_(self.state_film.weight)
+            nn.init.zeros_(self.state_film.bias)
 
     def forward(
         self,
@@ -78,6 +88,8 @@ class TensorNetInteraction(nn.Module):
         col_data: torch.Tensor,
         col_indices: torch.Tensor,
         col_indptr: torch.Tensor,
+        state_feat: torch.Tensor | None = None,
+        batch: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -92,10 +104,18 @@ class TensorNetInteraction(nn.Module):
             col_data: CSC column data indices for message passing.
             col_indices: CSC column indices for message passing.
             col_indptr: CSC column pointers for message passing.
+            state_feat: Embedded global state features, shape (num_graphs, dim_state_feats). Only used when the
+                layer was built with ``dim_state_feats > 0``.
+            batch: Graph index of each node, shape (num_nodes,). ``None`` for a single graph.
 
         Returns:
             X: Updated tensor representations, shape (num_nodes, 3, 3, units)
         """
+        state_node: torch.Tensor | None = None
+        if self.dim_state_feats > 0 and state_feat is not None:
+            state_node = _broadcast_to_nodes(state_feat, batch, X.size(0))
+            edge_attr = torch.cat([edge_attr, state_node[edge_index[0]]], dim=-1)
+
         C = cosine_cutoff(edge_weight, self.cutoff)
         edge_attr_processed = edge_attr
         for linear_scalar in self.linears_scalar:
@@ -142,4 +162,6 @@ class TensorNetInteraction(nn.Module):
         A = self.linears_tensor[4](A)
         S = self.linears_tensor[5](S)
         dX = fn_compose_tensor(I, A, S)
+        if state_node is not None and self.state_film is not None:
+            dX = dX * (1 + self.state_film(state_node)).unsqueeze(-2).unsqueeze(-2)
         return X + dX + fn_tensor_matmul_so3_3x3(dX, dX)

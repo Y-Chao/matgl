@@ -98,8 +98,8 @@ class TensorNet(MatGLModel):
             include_state (bool): Whether to condition the model on a per-graph integer state. Requires
                 ``ntypes_state`` and ``dim_state_embedding > 0``. The embedded state enters the tensor embedding
                 and every interaction block, and is updated from the node features between blocks. Forward
-                calls must then pass ``state_attr`` with one label per graph. Uses the PyG kernels (warp kernels
-                do not support state).
+                calls must then pass ``state_attr`` with one label per graph. Works with both the PyG and warp
+                backends (the state only enters invariant scalars, which are handled in PyTorch).
             nblocks (int, optional): The number of interaction layers.
                 (default: :obj:`2`)
             num_rbf (int, optional): The number of radial basis Gaussian functions :math:`\mu`.
@@ -139,21 +139,18 @@ class TensorNet(MatGLModel):
                 f"Invalid activation type, please try using one of {[af.name for af in ActivationFunction]}"
             ) from None
 
-        if include_state:
-            if not ntypes_state or not dim_state_embedding:
-                raise ValueError(
-                    "include_state=True requires ntypes_state (number of state labels, e.g. fidelities) and "
-                    f"dim_state_embedding > 0; got ntypes_state={ntypes_state}, "
-                    f"dim_state_embedding={dim_state_embedding}."
-                )
-            if use_warp:
-                raise ValueError("include_state=True is not supported by the warp kernels; pass use_warp=False.")
+        if include_state and (not ntypes_state or not dim_state_embedding):
+            raise ValueError(
+                "include_state=True requires ntypes_state (number of state labels, e.g. fidelities) and "
+                f"dim_state_embedding > 0; got ntypes_state={ntypes_state}, "
+                f"dim_state_embedding={dim_state_embedding}."
+            )
         if use_warp and not _warp_available:
             raise ImportError(
                 "use_warp=True but nvalchemi-toolkit-ops is not installed. "
                 "Install it or pass use_warp=False to use the plain PyG backend."
             )
-        self._use_warp = (_warp_available if use_warp is None else use_warp) and not include_state
+        self._use_warp = _warp_available if use_warp is None else use_warp
 
         self.element_types = element_types  # type: ignore
 
@@ -194,7 +191,6 @@ class TensorNet(MatGLModel):
         EmbeddingCls = TensorEmbeddingWarp if self._use_warp else TensorEmbeddingPyG  # type: ignore[assignment]
         InteractionCls = TensorNetInteractionWarp if self._use_warp else TensorNetInteractionPyG  # type: ignore[assignment]
 
-        # Only the PyG layers take ``dim_state_feats``; passing it unconditionally would break the warp layers.
         state_kwargs = {"dim_state_feats": dim_state_embedding} if include_state else {}
         self.tensor_embedding = EmbeddingCls(
             units=units,
@@ -302,7 +298,8 @@ class TensorNet(MatGLModel):
 
     def _update_state(self, X: torch.Tensor, state_feat: torch.Tensor, batch: torch.Tensor | None, i: int):
         """Residual M3GNet-style state update from the per-graph mean of invariant node norms."""
-        node_inv = self.state_node_norm(tensor_norm(X))
+        # PyG tensors are (N, units, 3, 3); warp tensors are (N, 3, 3, units).
+        node_inv = self.state_node_norm((X * X).sum((-3, -2)) if self._use_warp else tensor_norm(X))
         if batch is None:
             pooled = node_inv.mean(dim=0, keepdim=True)
         else:
@@ -340,6 +337,8 @@ class TensorNet(MatGLModel):
 
         fea_dict: dict[str, Any] = {"edge_attr": edge_attr}
 
+        batch = getattr(g, "batch", None)
+        state_feat = self._embed_state(g, state_attr) if self.include_state else None
         if self._use_warp:
             (  # type: ignore[name-defined]
                 row_data,
@@ -349,7 +348,9 @@ class TensorNet(MatGLModel):
                 col_indices,
                 col_indptr,
             ) = graph_transform(edge_index.int(), z.shape[0])  # type: ignore[union-attr]
-            X = self.tensor_embedding(z, edge_index, bond_dist, bond_vec, edge_attr, row_data, row_indptr)
+            X = self.tensor_embedding(
+                z, edge_index, bond_dist, bond_vec, edge_attr, row_data, row_indptr, state_feat, batch
+            )
             fea_dict["embedding"] = X
             for i, layer in enumerate(self.layers):
                 X = layer(
@@ -363,12 +364,14 @@ class TensorNet(MatGLModel):
                     col_data,
                     col_indices,
                     col_indptr,
+                    state_feat,
+                    batch,
                 )
                 fea_dict[f"gc_{i + 1}"] = X
+                if state_feat is not None and i < len(self.layers) - 1:
+                    state_feat = self._update_state(X, state_feat, batch, i)
             x = fn_tensor_norm3(X)  # type: ignore[name-defined]
         else:
-            batch = getattr(g, "batch", None)
-            state_feat = self._embed_state(g, state_attr) if self.include_state else None
             X, _ = self.tensor_embedding(z, edge_index, edge_attr, bond_dist, bond_vec, state_feat, batch)
             fea_dict["embedding"] = X
             for i, layer in enumerate(self.layers):
@@ -376,11 +379,11 @@ class TensorNet(MatGLModel):
                 fea_dict[f"gc_{i + 1}"] = X
                 if state_feat is not None and i < len(self.layers) - 1:
                     state_feat = self._update_state(X, state_feat, batch, i)
-            if state_feat is not None:
-                fea_dict["state_feat"] = state_feat
             scalars, skew_metrices, traceless_tensors = decompose_tensor(X)
             x = torch.cat((tensor_norm(scalars), tensor_norm(skew_metrices), tensor_norm(traceless_tensors)), dim=-1)
 
+        if state_feat is not None:
+            fea_dict["state_feat"] = state_feat
         x = self.out_norm(x)
         x = self.linear(x)
         fea_dict["readout"] = x

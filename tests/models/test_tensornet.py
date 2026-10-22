@@ -327,8 +327,7 @@ def test_model_multifidelity_state(graph_MoS, is_intensive):
     assert model.feature_dict["state_feat"].shape == (1, 8)
 
 
-def test_model_multifidelity_state_disables_warp():
+def test_model_multifidelity_state_keeps_warp_default():
+    """State conditioning no longer forces the PyG fallback; the backend default is unchanged."""
     model = TensorNet(include_state=True, ntypes_state=2, dim_state_embedding=8)
-    assert model._use_warp is False
-    with pytest.raises(ValueError, match="warp"):
-        TensorNet(include_state=True, ntypes_state=2, dim_state_embedding=8, use_warp=True)
+    assert model._use_warp is _warp_available
