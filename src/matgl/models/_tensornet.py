@@ -10,7 +10,8 @@ please refer to::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal
+import warnings
+from typing import Any, Literal
 
 import torch
 from torch import nn
@@ -25,7 +26,7 @@ from matgl.layers import (
 )
 from matgl.layers._embedding import TensorEmbedding as TensorEmbeddingPyG
 from matgl.layers._graph_convolution import TensorNetInteraction as TensorNetInteractionPyG
-from matgl.layers._readout_torch import (
+from matgl.layers._readout import (
     ReduceReadOut,
     WeightedAtomReadOut,
     WeightedReadOut,
@@ -43,8 +44,19 @@ try:
 except ImportError:
     _warp_available = False
 
-if TYPE_CHECKING:
-    from matgl.graph._converters import GraphConverter
+
+def _warn_ignored_tensornet_options(readout_type: str, field: str, is_intensive: bool) -> None:
+    """Warn about TensorNet options that are accepted for API compatibility but have no effect."""
+    if is_intensive and readout_type not in ("weighted_atom", "reduce_atom"):
+        warnings.warn(
+            f"TensorNet readout_type={readout_type!r} is not supported and falls back to a mean ('reduce_atom').",
+            UserWarning,
+            stacklevel=3,
+        )
+    if field != "node_feat":
+        warnings.warn(
+            f"TensorNet always reads out node features; field={field!r} is ignored.", UserWarning, stacklevel=3
+        )
 
 
 class TensorNet(MatGLModel):
@@ -117,7 +129,7 @@ class TensorNet(MatGLModel):
                 (default :obj:`"O(3)"`)
             dtype (torch.dtype): data type for all variables
             width (float): the width of Gaussian radial basis functions
-            readout_type (str): Readout function type, `set2set`, `weighted_atom` (default) or `reduce_atom`.
+            readout_type (str): Readout function type, `weighted_atom` (default) or `reduce_atom`.
             task_type (str): `classification` or `regression` (default).
             field (str): Using either "node_feat" or "edge_feat" for Set2Set and Reduced readout
             is_intensive (bool): Whether the prediction is intensive
@@ -145,6 +157,8 @@ class TensorNet(MatGLModel):
                 f"dim_state_embedding > 0; got ntypes_state={ntypes_state}, "
                 f"dim_state_embedding={dim_state_embedding}."
             )
+        _warn_ignored_tensornet_options(readout_type, field, is_intensive)
+
         if use_warp and not _warp_available:
             raise ImportError(
                 "use_warp=True but nvalchemi-toolkit-ops is not installed. "
@@ -237,6 +251,8 @@ class TensorNet(MatGLModel):
             task_type=task_type,
         )
         self.reset_parameters()
+        # Only some submodules take ``dtype`` explicitly; cast the readout / final layers too.
+        self.to(dtype)
 
     def _build_readout(
         self,
@@ -422,15 +438,17 @@ class TensorNet(MatGLModel):
         num_graphs = getattr(g, "num_graphs", None)
 
         if self.is_intensive:
-            node_vec = self.readout(x, batch)
+            node_vec = self.readout(x, batch, num_graphs=num_graphs)
             output = self.final_layer(node_vec)
             if self.task_type == "classification":
                 output = self.sigmoid(output)
             output = torch.squeeze(output)
         else:
-            atomic_energies = self.final_layer(x).view(-1)
+            atomic_energies = self.final_layer(x)  # (num_nodes, ntargets)
+            if atomic_energies.shape[-1] == 1:
+                atomic_energies = atomic_energies.view(-1)
             if batch is None:
-                output = atomic_energies.sum()
+                output = atomic_energies.sum(dim=0)
             else:
                 batch_long = batch.to(torch.long)
                 if num_graphs is None:
@@ -442,58 +460,3 @@ class TensorNet(MatGLModel):
         if return_all_layer_output:
             return fea_dict
         return output
-
-    def predict_structure(
-        self,
-        structure,
-        state_feats: torch.Tensor | None = None,
-        graph_converter: GraphConverter | None = None,
-        output_layers: list | None = None,
-        return_features: bool = False,
-    ):
-        """Convenience method to directly predict property from structure.
-
-        Args:
-            structure: An input crystal/molecule.
-            state_feats (torch.tensor): Graph attributes
-            graph_converter: Object that implements a get_graph_from_structure.
-            output_layers: List of names for the layer of GNN as output.
-            return_features (bool): **Deprecated.** Use ``model.feature_dict`` after
-                calling ``predict_structure`` instead. Will be removed in matgl v5.
-                If True, return specified layer outputs. If False, only return final output.
-
-        Returns:
-            output (torch.tensor): output property
-        """
-        if return_features:
-            _warn_feature_dict_kwarg("return_features")
-        allowed_output_layers = ["edge_attr", "embedding", "readout", "final"] + [
-            f"gc_{i + 1}" for i in range(self.num_layers)
-        ]
-
-        if not return_features:
-            output_layers = ["final"]
-        elif output_layers is None:
-            output_layers = allowed_output_layers
-        elif not isinstance(output_layers, list) or set(output_layers).difference(allowed_output_layers):
-            raise ValueError(f"Invalid output_layers, it must be a sublist of {allowed_output_layers}.")
-
-        if graph_converter is None:
-            from matgl.ext.pymatgen import Structure2Graph
-
-            graph_converter = Structure2Graph(element_types=self.element_types, cutoff=self.cutoff)  # type: ignore
-        g, lat, state_feats_default = graph_converter.get_graph(structure)
-        g.pbc_offshift = torch.matmul(g.pbc_offset, lat[0])
-        g.pos = g.frac_coords @ lat[0]
-        if state_feats is None:
-            state_feats = torch.tensor(state_feats_default)
-
-        if return_features:
-            self(g=g, state_attr=state_feats)
-            return {
-                k: v.detach() if isinstance(v, torch.Tensor) else v
-                for k, v in self.feature_dict.items()
-                if k in output_layers
-            }
-
-        return self(g=g, state_attr=state_feats).detach()

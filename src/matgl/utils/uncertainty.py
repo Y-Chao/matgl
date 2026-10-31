@@ -17,6 +17,7 @@ Reference:
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from typing import TYPE_CHECKING
 
 import torch
@@ -38,27 +39,31 @@ _DEFAULT_READOUT_ATTRS: tuple[str, ...] = ("final_dropout", "final_layer")
 
 
 def _inject_dropout(module: nn.Module, p: float) -> nn.Dropout | None:
-    """Append an ``nn.Dropout`` to the first ``layers`` ModuleList/Sequential in *module*.
+    """Insert dropout on the hidden features entering the last Linear in *module*.
 
     Works for ``MLP`` (``MLP.layers`` is a ``ModuleList`` whose ``forward`` iterates
-    linearly) so the injected dropout runs after the final ``Linear``.
+    linearly). Dropping the scalar output instead would make its uncertainty
+    a fixed fraction of the prediction, independent of the hidden features.
 
     Returns the new ``Dropout`` on success, ``None`` if no suitable ``layers``
     attribute was found.
     """
     layers = getattr(module, "layers", None)
     if isinstance(layers, (nn.ModuleList, nn.Sequential)):
-        drop = nn.Dropout(p)
-        layers.append(drop)
-        return drop
+        for index in range(len(layers) - 1, -1, -1):
+            if isinstance(layers[index], nn.Linear):
+                drop = nn.Dropout(p)
+                layers.insert(index, drop)
+                return drop
     return None
 
 
 class MCDropoutWrapper:
     """Uncertainty-aware wrapper for MatGL models using Monte Carlo Dropout.
 
-    Injects a dropout probability into the model's readout layers at construction
-    time. During ``predict_uncertainty``, the backbone stays deterministic (eval)
+    Copies the model and injects dropout into the copy's readout layers at construction
+    time, leaving the caller's parameters, modules and training mode untouched.
+    During ``predict_uncertainty``, the backbone stays deterministic (eval)
     while the readout dropout layers remain stochastic (train), giving per-structure
     predictive mean and standard deviation via N forward passes.
 
@@ -81,6 +86,8 @@ class MCDropoutWrapper:
 
         Args:
             model: Any pretrained ``MatGLModel`` (CHGNet, M3GNet, TensorNet, …).
+                A private copy is used; subsequent changes to the original model
+                are not reflected in the wrapper.
             dropout_p: Dropout probability to inject into readout layers. Default = 0.1.
             readout_attrs: Attribute names on ``model`` to search for dropout layers.
                 Defaults to ``("final_dropout", "final_layer")``. Override when using
@@ -94,6 +101,9 @@ class MCDropoutWrapper:
         if not 0.0 < dropout_p < 1.0:
             raise ValueError(f"dropout_p must be in (0, 1), got {dropout_p}")
 
+        # Cached activations can be non-leaf tensors, which torch cannot deepcopy.
+        # They are recomputed on the first prediction and need not be copied.
+        model = deepcopy(model, {id(model.feature_dict): {}})
         self.model = model
         self.dropout_p = dropout_p
         self._stochastic_modules: list[nn.Dropout] = []
@@ -158,22 +168,12 @@ class MCDropoutWrapper:
     ) -> tuple:
         """Convert a structure to a (graph, state_feats) pair.
 
-        Replicates the graph-setup boilerplate shared by all MatGL
-        ``predict_structure`` implementations so we can convert each structure
-        once and reuse the graph across all N forward passes.
+        Uses the same conversion as ``MatGLModel.predict_structure`` so each structure
+        is converted once and the graph reused across all N forward passes.
         """
-        if graph_converter is None:
-            from matgl.ext.pymatgen import Structure2Graph
+        from matgl.models._core import structure_to_graph
 
-            graph_converter = Structure2Graph(
-                element_types=self.model.element_types,  # type: ignore[attr-defined, arg-type]
-                cutoff=self.model.cutoff,  # type: ignore[attr-defined, arg-type]
-            )
-
-        g, lat, state_feats_default = graph_converter.get_graph(structure)
-        g.pbc_offshift = torch.matmul(g.pbc_offset, lat[0])
-        g.pos = g.frac_coords @ lat[0]
-        state_feats = torch.tensor(state_feats_default)
+        g, state_feats = structure_to_graph(self.model, structure, graph_converter)
         return g, state_feats
 
     def predict_uncertainty(

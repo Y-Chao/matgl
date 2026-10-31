@@ -2,7 +2,8 @@
 requires = [
     # pin NumPy version used in the build
     "oldest-supported-numpy",
-    "setuptools>=58.0.3",
+    "setuptools>=64",
+    "setuptools-scm>=8",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -57,7 +58,7 @@ dependencies = [
     "pymatgen-core>=2026.5.18",
     "huggingface_hub>=0.24",
 ]
-version = "4.1.0"
+dynamic = ["version"]
 
 [project.scripts]
 mgl = "matgl.cli:main"
@@ -76,6 +77,10 @@ alchmtk = [
 jax = [
   "jax>=0.4.30",
 ]
+
+[tool.setuptools_scm]
+tag_regex = '^v(?P<version>\d+\.\d+\.\d+)$'
+version_scheme = "no-guess-dev"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -154,6 +159,7 @@ lint.ignore = [
     "PLR0912",  # too-many-branches
     "PLR0913",  # too-many-arguments
     "PLR0915",  # too-many-statements
+    "PLR0917",  # too-many-positional-arguments (stable since ruff 0.17; same rationale as PLR0913)
     "PLR2004",  # magic-value-comparison
 ]
 lint.pydocstyle.convention = "google"
@@ -170,12 +176,6 @@ lint.isort.required-imports = ["from __future__ import annotations"]
 # decomposition components ``I``, ``A``, ``S`` (E741) follow physics conventions
 # and should not be renamed.
 "src/matgl/kernels/*" = ["E741", "I002"]
-# GRACE / ACE machinery uses ``l`` as the canonical angular-momentum index
-# throughout (matches the physics literature and the upstream gracemaker
-# implementation). Renaming would obscure the math.
-"src/matgl/layers/_grace.py" = ["E741"]
-"src/matgl/models/_grace.py" = ["E741"]
-"tests/models/test_grace_parity_tp.py" = ["E741"]
 
 [tool.pytest.ini_options]
 addopts = "--durations=30 --quiet -rXs --color=yes -p no:warnings"
@@ -238,6 +238,8 @@ exclude_lines = [
 
 [dependency-groups]
 dev = [
+    # Pull in mypy/ruff so a plain ``uv sync`` can run the Lint workflow commands locally.
+    { include-group = "lint" },
     "coverage>=7.7.1",
     "docutils>=0.21.2",
     "invoke>=2.2.0",

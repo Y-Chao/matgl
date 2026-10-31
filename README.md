@@ -148,7 +148,7 @@ as other simple administrative tasks (e.g., clearing the cache). Some simple exa
 2. To use one of the pre-trained property models,
 
     ```bash
-    mgl predict --model M3GNet-Eform-MP-2018.6.1 --infile Li2O.cif
+    mgl predict --model M3GNet-Eform-MP-2019.4.1 --infile Li2O.cif
     ```
 
 3. To clear the cache,
@@ -170,10 +170,10 @@ passing the repo id in `"owner/name"` form. Pre-trained models released by the [
 import matgl
 
 # Load directly from a Hugging Face Hub repo id.
-model = matgl.load_model("materialyze/TensorNet-PES-MatPES-2025.2")
+model = matgl.load_model("materialyze/TensorNet-PES-MatPES-r2SCAN-2025.2")
 
 # For materialyze org, you can also just use the bare model names directly.
-model = matgl.load_model("TensorNet-PES-MatPES-2025.2")
+model = matgl.load_model("TensorNet-PES-MatPES-r2SCAN-2025.2")
 ```
 
 To publish a trained model to the Hugging Face Hub, use `push_to_hub` (requires `huggingface-cli login` or a `token`):
@@ -198,7 +198,7 @@ The following is an example of a prediction of the formation energy for CsCl.
 from pymatgen.core import Lattice, Structure
 import matgl
 
-model = matgl.load_model("MEGNet-Eform-MP-2018.6.1")
+model = matgl.load_model("M3GNet-Eform-MP-2019.4.1")
 
 # This is the structure obtained from the Materials Project.
 struct = Structure.from_spacegroup("Pm-3m", Lattice.cubic(4.1437), ["Cs", "Cl"], [[0, 0, 0], [0.5, 0.5, 0.5]])
@@ -346,6 +346,23 @@ In the PES training, the unit of energies, forces and stresses (optional) in the
 - stresses: a list of 3x3 stress matrices with unit GPa (optional)
 
 Note: For stresses, we use the convention that compressive stress gives negative values. Stresses obtained from VASP calculations (default unit is kBar) should be multiplied by -0.1 to work directly with the model.
+
+`Potential` and `MGLPotentialTrainer` apply `E = data_std * E_model + data_mean + E_element_refs`.
+`data_mean` is a constant added once per structure, independent of atom count. Keep it at `0.0` for an
+extensive potential and supply atomic energy offsets through `element_refs`. `data_std` scales total
+energies and their derivatives, including forces and stresses.
+
+For structure-property training, `ModelLightningModule` applies its `data_mean` and `data_std` in the loss.
+Calling `lit.model.save(...)` saves the raw model. To retain that normalization in an inference model, save
+the existing target-transform wrapper:
+
+```python
+from matgl.data.transformer import Normalizer
+from matgl.models import TransformedTargetModel
+
+exported = TransformedTargetModel(lit.model, Normalizer(lit.data_mean, lit.data_std))
+exported.save("property-model")
+```
 
 ### `MGLPotentialTrainer`
 

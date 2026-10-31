@@ -64,3 +64,11 @@ def test_atom_ref_with_states_requires_one_label_per_graph(graph_MoSH):
     for bad in (None, torch.tensor([0.0, 0.0])):
         with pytest.raises(ValueError, match="state_attr"):
             element_ref(g1, bad)
+
+
+def test_atom_ref_with_states_batched_values(graph_MoSH):
+    _, g1, _ = graph_MoSH
+    element_ref = AtomRef(torch.tensor([[0.5, 1.0, 2.0], [2.0, 3.0, 5.0]]))
+    out = element_ref(_batch([g1, g1]), torch.tensor([0, 1]))
+    assert out.shape == (2,)
+    assert torch.allclose(out, torch.tensor([3.5, 10.0]))

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
-from ase import Atoms
+from ase import Atoms, units
 from ase.io import read, write
 from pymatgen.core import Lattice, Molecule, Structure
 from pymatgen.io.ase import AseAtomsAdaptor
@@ -69,17 +69,6 @@ def test_format_site_delta(tiny_structure):
     out = cli._format_site_delta(formatter, tiny_structure[0], tiny_structure[1])
     assert "->" in out
     assert "Mo" in out
-
-
-def test_resolve_state_attributes_errors():
-    with pytest.raises(ValueError, match="must be supplied"):
-        cli._resolve_state_attributes(None, 1)
-    with pytest.raises(ValueError, match="must match"):
-        cli._resolve_state_attributes(["1"], 2)
-
-
-def test_resolve_state_attributes_coerces_to_int():
-    assert cli._resolve_state_attributes(["0", "1", "2"], 3) == [0, 1, 2]
 
 
 def test_configure_logging_verbose():
@@ -241,23 +230,6 @@ def test_predict_structure_eform(tiny_cif, fake_potential, capsys):
     fake_potential.predict_structure.assert_called_once()
 
 
-def test_predict_structure_bandgap_with_state(tiny_cif, fake_potential, capsys):
-    """Bandgap model branch: state attribute selects the functional label."""
-    with patch.object(cli, "_load_potential", return_value=fake_potential):
-        cli.predict_structure(
-            Namespace(
-                model="MEGNet-MP-2019.4.1-BandGap-mfi",
-                infile=[str(tiny_cif)],
-                mpids=None,
-                state_attr=["1"],
-            )
-        )
-    captured = capsys.readouterr().out
-    # state_attr=1 maps to "GLLB-SC".
-    assert "GLLB-SC" in captured
-    assert "eV" in captured
-
-
 def test_predict_structure_with_mpids(fake_potential, capsys, tiny_structure):
     """mpids branch: pulls structures via MPRester and prints predictions.
 
@@ -307,26 +279,6 @@ def test_predict_nonperiodic_extxyz_uses_molecule_converter(tmp_path, fake_poten
     assert converter.__class__.__name__ == "Molecule2Graph"
 
 
-def test_predict_bandgap_nonperiodic_extxyz_uses_molecule_converter(tmp_path, fake_potential):
-    path = tmp_path / "h2.xyz"
-    write(path, Atoms("H2", positions=[[0, 0, 0], [0.74, 0, 0]]), format="extxyz")
-    fake_potential.element_types = ("H",)
-    fake_potential.cutoff = 2.0
-
-    with patch.object(cli, "_load_potential", return_value=fake_potential):
-        cli.predict_structure(
-            Namespace(
-                model="MEGNet-MP-2019.4.1-BandGap-mfi",
-                infile=[str(path)],
-                mpids=None,
-                state_attr=["0"],
-            )
-        )
-
-    converter = fake_potential.predict_structure.call_args.kwargs["graph_converter"]
-    assert converter.__class__.__name__ == "Molecule2Graph"
-
-
 def test_molecular_dynamics(tiny_cif):
     """MD command should construct MolecularDynamics with the parsed args and run."""
     args = Namespace(
@@ -359,6 +311,8 @@ def test_molecular_dynamics(tiny_cif):
         mock_adaptor_cls.return_value.get_atoms.return_value = MagicMock(name="atoms")
         assert cli.molecular_dynamics(args) == 0
     mock_md_cls.assert_called_once()
+    # CLI pressure is in bar; MolecularDynamics expects eV/A^3.
+    assert mock_md_cls.call_args.kwargs["pressure"] == pytest.approx(1.0 * units.bar)
     mock_boltz.assert_called_once()
     fake_md.run.assert_called_once_with(2)
 

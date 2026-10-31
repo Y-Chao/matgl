@@ -22,7 +22,7 @@ from matgl.config import MATGL_CACHE
 from matgl.utils.constants import EV_PER_ANG3_TO_GPA
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
     from pathlib import Path
 
     from numpy.typing import ArrayLike
@@ -33,8 +33,87 @@ if TYPE_CHECKING:
     from matgl.graph.data import MGLDataset
 
 
+class _EpochErrorMetric(torchmetrics.Metric):
+    """Exact epoch-level MAE or RMSE accumulated from per-batch values.
+
+    Each batch contributes its MAE (or RMSE) together with the number of labelled elements it was computed over,
+    so the epoch value is ``sum(|err|) / n`` (or ``sqrt(sum(err**2) / n)``) over all elements seen in the epoch,
+    rather than a mean of per-batch values weighted by the number of structures. States are summed across
+    processes, so the result is also correct under DDP.
+    """
+
+    full_state_update = False
+    total: torch.Tensor
+    count: torch.Tensor
+
+    def __init__(self, squared: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.squared = squared
+        # float32 sum and int64 count, as in torchmetrics' own MeanAbsoluteError: MPS has no float64.
+        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0, dtype=torch.long), dist_reduce_fx="sum")
+
+    def update(self, value: torch.Tensor, count: torch.Tensor | int) -> None:
+        """Add one batch.
+
+        Args:
+            value: Per-batch MAE, or RMSE when ``squared=True``.
+            count: Number of labelled elements the batch value was averaged over.
+        """
+        # No .item() / Python branching on device tensors: avoids a host-device sync per metric per step.
+        count = torch.as_tensor(count, dtype=torch.long, device=self.count.device)
+        value = value.detach().reshape(-1)[0].to(device=self.total.device, dtype=self.total.dtype)
+        contribution = (value**2 if self.squared else value) * count
+        # A component with no labelled elements may report NaN; it must not poison the epoch sum.
+        self.total += torch.where(count > 0, contribution, torch.zeros_like(contribution))
+        self.count += count
+
+    def compute(self) -> torch.Tensor:
+        """Return the epoch MAE (or RMSE); zero if no labelled elements were seen."""
+        # total is zero whenever count is, so clamping avoids 0/0 without a host-device sync.
+        mean = self.total / self.count.clamp_min(1)
+        return torch.sqrt(mean) if self.squared else mean
+
+
 class MatglLightningModuleMixin:
     """Mix-in class implementing common functions for training."""
+
+    # Element counts behind each MAE/RMSE of the latest step(); consumed by _log_results.
+    _last_metric_counts: dict[str, Any] | None = None
+
+    def _init_epoch_metrics(self, keys: Sequence[str]) -> None:
+        """Create per-split epoch accumulators for the ``*MAE`` / ``*RMSE`` keys returned by ``loss_fn``."""
+        self.epoch_metrics = nn.ModuleDict(
+            {
+                f"{split}_{key}": _EpochErrorMetric(squared=key.endswith("RMSE"))
+                for split in ("train", "val", "test")
+                for key in keys
+            }
+        )
+
+    def _log_results(self, split: str, results: dict[str, Any], batch_size: int) -> None:
+        """Log step results; MAE/RMSE go through exact epoch accumulators when their element counts are known."""
+        epoch_metrics = getattr(self, "epoch_metrics", None)
+        counts = self._last_metric_counts or {}
+        # Consume the counts so a later step that does not set them can never reuse stale ones.
+        self._last_metric_counts = None
+        per_batch = {}
+        for key, val in results.items():
+            name = f"{split}_{key}"
+            if epoch_metrics is not None and name in epoch_metrics and key in counts:
+                metric = epoch_metrics[name]
+                metric.update(val, counts[key])
+                self.log(name, metric, on_epoch=True, on_step=False, prog_bar=True)  # type: ignore[attr-defined]
+            else:
+                per_batch[name] = val
+        self.log_dict(  # type: ignore[attr-defined]
+            per_batch,
+            batch_size=batch_size,
+            on_epoch=True,
+            on_step=False,
+            prog_bar=True,
+            sync_dist=self.sync_dist,  # type: ignore[attr-defined]
+        )
 
     def training_step(self, batch: tuple, batch_idx: int) -> Any:
         """Training step.
@@ -47,21 +126,9 @@ class MatglLightningModuleMixin:
            Total loss.
         """
         results, batch_size = self.step(batch)  # type: ignore
-        self.log_dict(  # type: ignore
-            {f"train_{key}": val for key, val in results.items()},
-            batch_size=batch_size,
-            on_epoch=True,
-            on_step=False,
-            prog_bar=True,
-            sync_dist=self.sync_dist,  # type: ignore
-        )
+        self._log_results("train", results, batch_size)
 
         return results["Total_Loss"]
-
-    def on_train_epoch_end(self) -> None:
-        """Step scheduler every epoch."""
-        sch = self.lr_schedulers()  # type: ignore[attr-defined]
-        sch.step()
 
     def optimizer_zero_grad(
         self,
@@ -85,14 +152,7 @@ class MatglLightningModuleMixin:
             batch_idx: Batch index.
         """
         results, batch_size = self.step(batch)  # type: ignore
-        self.log_dict(  # type: ignore
-            {f"val_{key}": val for key, val in results.items()},
-            batch_size=batch_size,
-            on_epoch=True,
-            on_step=False,
-            prog_bar=True,
-            sync_dist=self.sync_dist,  # type: ignore
-        )
+        self._log_results("val", results, batch_size)
         return results["Total_Loss"]
 
     def test_step(self, batch: tuple, batch_idx: int) -> dict[str, Any]:
@@ -107,14 +167,7 @@ class MatglLightningModuleMixin:
         # force/stress computation, and the non-PES path (ModelLightningModule)
         # legitimately runs under Lightning's default eval mode.
         results, batch_size = self.step(batch)  # type: ignore
-        self.log_dict(  # type: ignore
-            {f"test_{key}": val for key, val in results.items()},
-            batch_size=batch_size,
-            on_epoch=True,
-            on_step=False,
-            prog_bar=True,
-            sync_dist=self.sync_dist,  # type: ignore
-        )
+        self._log_results("test", results, batch_size)
         return results
 
     def configure_optimizers(self) -> tuple[list[torch.optim.Optimizer], list[torch.optim.lr_scheduler.LRScheduler]]:
@@ -167,7 +220,13 @@ class MatglLightningModuleMixin:
 
 
 class ModelLightningModule(MatglLightningModuleMixin, pl.LightningModule):
-    """A PyTorch.LightningModule for training MatGL structure-wise property models."""
+    """A PyTorch.LightningModule for training MatGL structure-wise property models.
+
+    ``data_std * prediction + data_mean`` is applied when computing the loss.
+    Saving ``lit.model`` alone saves the raw model without this transform. To
+    export predictions in target units, save a ``TransformedTargetModel`` wrapping
+    ``lit.model`` with ``Normalizer(lit.data_mean, lit.data_std)``.
+    """
 
     def __init__(
         self,
@@ -208,6 +267,7 @@ class ModelLightningModule(MatglLightningModuleMixin, pl.LightningModule):
         self.include_line_graph = include_line_graph
         self.mae = torchmetrics.MeanAbsoluteError()
         self.rmse = torchmetrics.MeanSquaredError(squared=False)
+        self._init_epoch_metrics(("MAE", "RMSE"))
         self.data_mean = data_mean
         self.data_std = data_std
         self.lr = lr
@@ -281,6 +341,8 @@ class ModelLightningModule(MatglLightningModuleMixin, pl.LightningModule):
             preds = self(g=g, lat=lat, state_attr=state_attr)
         results = self.loss_fn(loss=self.loss, preds=preds, labels=labels)  # type: ignore
         batch_size = preds.numel()
+        n_labels = labels.numel()
+        self._last_metric_counts = {"MAE": n_labels, "RMSE": n_labels}
         return results, batch_size
 
     def loss_fn(self, loss: nn.Module, labels: torch.Tensor, preds: torch.Tensor) -> dict[str, Any]:
@@ -343,8 +405,9 @@ class PotentialLightningModule(MatglLightningModuleMixin, pl.LightningModule):
             stress_weight: relative importance of stress
             magmom_weight: relative importance of additional magmom predictions.
             charge_weight: relative importance of additional charge predictions.
-            data_mean: average of training data
-            data_std: standard deviation of training data
+            data_mean: Constant energy offset added once per structure, not per atom.
+                Keep 0.0 for extensivity; use element_refs for atomic energy offsets.
+            data_std: Multiplicative scale on total energies and their derivatives.
             loss: loss function used for training
             loss_params: parameters for loss function
             optimizer: optimizer for training
@@ -369,6 +432,9 @@ class PotentialLightningModule(MatglLightningModuleMixin, pl.LightningModule):
 
         self.mae = torchmetrics.MeanAbsoluteError()
         self.rmse = torchmetrics.MeanSquaredError(squared=False)
+        self._init_epoch_metrics(
+            [f"{q}_{m}" for q in ("Energy", "Force", "Stress", "Magmom", "Charge") for m in ("MAE", "RMSE")]
+        )
         self.register_buffer("data_mean", torch.tensor(data_mean))
         self.register_buffer("data_std", torch.tensor(data_std))
 
@@ -518,6 +584,7 @@ class PotentialLightningModule(MatglLightningModuleMixin, pl.LightningModule):
             num_atoms=num_atoms,
         )
         batch_size = preds[0].numel()
+        self._last_metric_counts = self._metric_counts(labels)
 
         self._last_preds = preds
         self._last_labels = labels
@@ -568,6 +635,26 @@ class PotentialLightningModule(MatglLightningModuleMixin, pl.LightningModule):
             "indices": self._last_indices,
             "num_atoms": self._last_num_atoms,
         }
+
+    def _metric_counts(self, labels: tuple) -> dict[str, torch.Tensor]:
+        """Number of labelled elements behind each MAE/RMSE returned by ``loss_fn``.
+
+        Missing (NaN) labels are excluded, matching ``allow_missing_labels``. Components that ``loss_fn`` does not
+        evaluate get a count of zero so they do not contribute to the epoch value.
+        """
+
+        def n_valid(label: torch.Tensor) -> torch.Tensor:
+            return (~torch.isnan(label)).sum()
+
+        zero = torch.zeros((), dtype=torch.long, device=labels[0].device)
+        counts = {
+            "Energy": n_valid(labels[0]),
+            "Force": n_valid(labels[1]),
+            "Stress": n_valid(labels[2]) if self.model.calc_stresses else zero,
+            "Magmom": n_valid(labels[3]) if self.model.calc_magmom and len(labels) > 3 else zero,
+            "Charge": n_valid(labels[3]) if self.model.calc_charge and len(labels) > 3 else zero,
+        }
+        return {f"{q}_{m}": n for q, n in counts.items() for m in ("MAE", "RMSE")}
 
     def loss_fn(
         self,
@@ -625,14 +712,18 @@ class PotentialLightningModule(MatglLightningModuleMixin, pl.LightningModule):
         e_label_per_atom = valid_labels[0] / valid_num_atoms
         e_pred_per_atom = valid_preds[0] / valid_num_atoms
 
-        e_loss = self.loss(e_label_per_atom, e_pred_per_atom, **self.loss_params)
-        f_loss = self.loss(valid_labels[1], valid_preds[1], **self.loss_params)
+        def _terms(
+            loss_fn: Callable[..., torch.Tensor], label: torch.Tensor, pred: torch.Tensor
+        ) -> tuple[torch.Tensor, ...]:
+            # With allow_missing_labels, a batch may have no valid entries for a component; the mean over an
+            # empty tensor is NaN, so return zeros (kept on the autograd graph via pred) instead.
+            if label.numel() == 0:
+                zero = pred.sum() * 0.0
+                return zero, zero.detach(), zero.detach()
+            return loss_fn(label, pred, **self.loss_params), self.mae(label, pred), self.rmse(label, pred)
 
-        e_mae = self.mae(e_label_per_atom, e_pred_per_atom)
-        f_mae = self.mae(valid_labels[1], valid_preds[1])
-
-        e_rmse = self.rmse(e_label_per_atom, e_pred_per_atom)
-        f_rmse = self.rmse(valid_labels[1], valid_preds[1])
+        e_loss, e_mae, e_rmse = _terms(self.loss, e_label_per_atom, e_pred_per_atom)
+        f_loss, f_mae, f_rmse = _terms(self.loss, valid_labels[1], valid_preds[1])
 
         dev = valid_labels[0].device
         s_mae = torch.zeros(1, device=dev)
@@ -647,12 +738,10 @@ class PotentialLightningModule(MatglLightningModuleMixin, pl.LightningModule):
         total_loss = self.energy_weight * e_loss + self.force_weight * f_loss
 
         if self.model.calc_stresses:
-            s_loss = loss(valid_labels[2], valid_preds[2], **self.loss_params)
-            s_mae = self.mae(valid_labels[2], valid_preds[2])
-            s_rmse = self.rmse(valid_labels[2], valid_preds[2])
+            s_loss, s_mae, s_rmse = _terms(loss, valid_labels[2], valid_preds[2])
             total_loss = total_loss + self.stress_weight * s_loss
 
-        if self.model.calc_magmom and labels[3].numel() > 0:
+        if self.model.calc_magmom and valid_labels[3].numel() > 0:
             if self.magmom_target == "symbreak":
                 # Each metric was being recomputed twice for the +/- predictions; cache
                 # the four tensors and pick the per-element minimum at the end.
@@ -665,17 +754,11 @@ class PotentialLightningModule(MatglLightningModuleMixin, pl.LightningModule):
                 m_rmse = torch.min(self.rmse(valid_labels[3], valid_preds[3]), self.rmse(valid_labels[3], neg_pred))
             else:
                 labels_3 = torch.abs(valid_labels[3]) if self.magmom_target == "absolute" else valid_labels[3]
-                m_loss = loss(labels_3, valid_preds[3], **self.loss_params)
-                m_mae = self.mae(labels_3, valid_preds[3])
-                m_rmse = self.rmse(labels_3, valid_preds[3])
+                m_loss, m_mae, m_rmse = _terms(loss, labels_3, valid_preds[3])
             total_loss = total_loss + self.magmom_weight * m_loss
 
-        # Use the NaN-masked tensors so structures without charge labels are skipped; a batch with no charge
-        # labels at all contributes nothing (an empty loss would otherwise be NaN).
-        if self.model.calc_charge and valid_labels[3].numel() > 0:
-            q_loss = loss(valid_labels[3], valid_preds[3], **self.loss_params)
-            q_mae = self.mae(valid_labels[3], valid_preds[3])
-            q_rmse = self.rmse(valid_labels[3], valid_preds[3])
+        if self.model.calc_charge:
+            q_loss, q_mae, q_rmse = _terms(loss, valid_labels[3], valid_preds[3])
             total_loss = total_loss + self.charge_weight * q_loss
 
         return {
@@ -840,7 +923,7 @@ def xavier_init(model: nn.Module, gain: float = 1.0, distribution: Literal["unif
             if distribution == "uniform":
                 param.data.uniform_(-bound, bound)
             else:
-                param.data.normal_(0, bound**2)
+                param.data.normal_(0, bound / math.sqrt(3))  # std of U(-bound, bound)
         else:
             init_fn(param.data, gain=gain)
 
@@ -1634,7 +1717,7 @@ class MGLPotentialTrainer:
 
         Args:
             model: The graph model to wrap (e.g. ``TensorNet(...)``,
-                ``GRACE(...)``, ``M3GNet(...)``). Must already be configured
+                ``M3GNet(...)``). Must already be configured
                 with the ``element_types`` and ``cutoff`` you want to train.
             energy_weight: Energy loss weight.
             force_weight: Force loss weight.
@@ -1654,10 +1737,11 @@ class MGLPotentialTrainer:
                 ``"smooth_l1_loss"``, or ``"l1_loss"``.
             loss_params: Optional kwargs forwarded to the loss function (e.g.
                 ``{"delta": 0.1}`` for Huber).
-            data_mean: Per-atom energy mean used by the inner ``Potential`` to
-                rescale predictions before the loss is computed. Forwarded to
-                :class:`PotentialLightningModule`. Default ``0.0``.
-            data_std: Per-atom energy / force scale used by the inner
+            data_mean: Constant energy offset added once per structure by the inner
+                ``Potential``, independent of atom count. Keep ``0.0`` for an extensive
+                potential, including when ``element_refs`` supplies atomic energy offsets.
+                Forwarded to :class:`PotentialLightningModule`. Default ``0.0``.
+            data_std: Multiplicative scale on total energies, forces and stresses used by the inner
                 ``Potential`` to rescale predictions before the loss is
                 computed. Typical recipe for foundation-potential training:
                 pass the RMS of all force components in the training set so

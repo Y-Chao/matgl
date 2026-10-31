@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -94,16 +93,15 @@ def test_iomixin_num_parameters():
     assert model.num_parameters == 5 * 3 + 3
 
 
-def test_model_versioning():
+def test_model_versioning(tmp_path):
     model = OldModel(1, k=2)
-    model.save("OldModel")
+    model.save(tmp_path / "OldModel")
     with pytest.warns(UserWarning, match="Incompatible model version detected!"):
-        model2 = NewModel.load("OldModel")
+        model2 = NewModel.load(tmp_path / "OldModel")
     # Model will still load since there are no incompatibilities. Check the properties are reloaded.
     assert isinstance(model2, NewModel)
     assert model2.n == 1
     assert model2._init_args["k"] == 2
-    shutil.rmtree("OldModel")
 
 
 @pytest.mark.skipif(os.getenv("CI") == "true", reason="Unreliable in CI environments.")
@@ -266,19 +264,16 @@ def test_load_bad_model():
     with pytest.raises(ValueError, match=r"Bad serialized model or bad model name."):
         load_model("badbadmodelname")
 
-    try:
-        os.makedirs("bad_serialized_model")
-        with open("bad_serialized_model/model.json", "w") as f:
-            f.write("hello")
-        with open("bad_serialized_model/model.pt", "w") as f:
-            f.write("hello")
-        with open("bad_serialized_model/state.pt", "w") as f:
-            f.write("hello")
+    os.makedirs("bad_serialized_model")
+    with open("bad_serialized_model/model.json", "w") as f:
+        f.write("hello")
+    with open("bad_serialized_model/model.pt", "w") as f:
+        f.write("hello")
+    with open("bad_serialized_model/state.pt", "w") as f:
+        f.write("hello")
 
-        with pytest.raises(ValueError, match="Bad serialized model"):
-            load_model("bad_serialized_model")
-    finally:
-        shutil.rmtree("bad_serialized_model")
+    with pytest.raises(ValueError, match="Bad serialized model"):
+        load_model("bad_serialized_model")
 
 
 def test_load_model_wraps_unknown_error_as_runtime_error(tmp_path):
@@ -394,3 +389,48 @@ def test_get_available_pretrained_models_strips_owner_prefix():
         names = get_available_pretrained_models()
 
     assert names == ["Alpha", "Zeta"]
+
+
+class ModelWithBuffer(torch.nn.Module, IOMixIn):
+    """IOMixIn model with a parameter and a constructor-derived buffer."""
+
+    def __init__(self, cutoff=5.0):
+        super().__init__()
+        self.save_args(locals())
+        self.lin = torch.nn.Linear(5, 3)
+        self.register_buffer("cutoff", torch.tensor(cutoff))
+
+
+def _rewrite_state(path, edit):
+    state = torch.load(path / "state.pt", weights_only=True)
+    edit(state)
+    torch.save(state, path / "state.pt")
+
+
+def test_load_rejects_missing_parameters(tmp_path):
+    """A renamed parameter must not be silently left at its random initialization."""
+    ModelWithBuffer().save(tmp_path)
+    # E.g. a checkpoint that stores a submodule one level deeper than the current code expects.
+    _rewrite_state(tmp_path, lambda s: s.update({f"old.{k}": s.pop(k) for k in ["lin.weight", "lin.bias"]}))
+    with pytest.raises(RuntimeError, match=r"2 parameter\(s\) would be left randomly initialized"):
+        ModelWithBuffer.load(tmp_path)
+
+
+def test_load_allows_missing_buffers(tmp_path):
+    """Buffers rebuilt from constructor args (e.g. cutoffs) may be absent from older checkpoints."""
+    model = ModelWithBuffer(cutoff=4.0)
+    model.save(tmp_path)
+    _rewrite_state(tmp_path, lambda s: s.pop("cutoff"))
+    loaded = ModelWithBuffer.load(tmp_path)
+    assert float(loaded.cutoff) == 4.0
+    assert torch.equal(loaded.lin.weight, model.lin.weight)
+
+
+def test_load_warns_on_unexpected_keys(tmp_path, caplog):
+    ModelWithBuffer().save(tmp_path)
+    _rewrite_state(tmp_path, lambda s: s.update({"stale.weight": torch.zeros(2), "refs.onehot": torch.eye(3)}))
+    with caplog.at_level("WARNING", logger="matgl.utils.io"):
+        ModelWithBuffer.load(tmp_path)
+    assert "stale.weight" in caplog.text
+    # Known-benign stale buffers are not reported.
+    assert "onehot" not in caplog.text

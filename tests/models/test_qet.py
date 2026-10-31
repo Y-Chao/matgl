@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import torch
 from pymatgen.core import Lattice, Structure
@@ -33,7 +31,7 @@ def _single_atom_graph(cutoff=5.0):
     return element_types, graph, state
 
 
-def test_qet(graph_MoS):
+def test_qet(graph_MoS, tmp_path):
     """Forward across activations + save/load + SO(3) variant."""
     torch.manual_seed(0)
     torch.use_deterministic_algorithms(True)
@@ -47,10 +45,8 @@ def test_qet(graph_MoS):
         output = model(g=graph, total_charge=torch.tensor([0.0]))
         assert torch.numel(output) == 1
 
-    model.save(".")
-    QET.load(".")
-    for fname in ("model.pt", "model.json", "state.pt"):
-        os.remove(fname)
+    model.save(tmp_path)
+    QET.load(tmp_path)
 
     model = _make_qet(is_intensive=False, equivariance_invariance_group="SO(3)")
     output = model(g=graph, total_charge=torch.tensor([0.0]))
@@ -252,3 +248,17 @@ def test_qet_mfi_all_parameters_receive_gradients(MoS, nblocks):
     no_grad = [n for n, p in pot.model.named_parameters() if p.requires_grad and p.grad is None]
     state_no_grad = [n for n in no_grad if "state" in n]
     assert not state_no_grad, state_no_grad
+
+
+def test_qet_float64_dtype(graph_MoS):
+    """``dtype=torch.float64`` must also cover the QET-specific heads (chi, hardness, norm, final layer)."""
+    structure, graph, _ = graph_MoS
+    lat = torch.tensor(structure.lattice.matrix, dtype=torch.float64)
+    graph = graph.clone()
+    graph.pos = graph.frac_coords.double() @ lat
+    graph.pbc_offshift = graph.pbc_offset.double() @ lat
+    model = _make_qet(is_intensive=False, dtype=torch.float64)
+    assert {p.dtype for p in model.parameters()} == {torch.float64}
+    assert model.sigma.dtype == torch.float64
+    output = model(g=graph, total_charge=torch.zeros(1, dtype=torch.float64))
+    assert output.dtype == torch.float64

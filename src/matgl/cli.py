@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
+from ase import units
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from pymatgen.core.structure import Molecule, Structure
 from pymatgen.io.ase import AseAtomsAdaptor
@@ -207,15 +208,6 @@ def relax_structure(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_state_attributes(state_attr: Sequence[str | int] | None, expected_count: int) -> Sequence[int]:
-    """Coerce state attributes to integers and validate lengths."""
-    if state_attr is None:
-        raise ValueError("State attributes must be supplied for this model.")
-    if len(state_attr) != expected_count:
-        raise ValueError("Number of state attributes must match the number of input files.")
-    return [int(s) for s in state_attr]
-
-
 def predict_structure(args: argparse.Namespace) -> None:
     """Predict scalar properties for structures or Materials Project IDs.
 
@@ -227,28 +219,15 @@ def predict_structure(args: argparse.Namespace) -> None:
     """
     model = _load_potential(args.model)
     if args.infile:
-        if args.model == "MEGNet-MP-2019.4.1-BandGap-mfi":
-            state_dict = ["PBE", "GLLB-SC", "HSE", "SCAN"]
-            attrs = _resolve_state_attributes(args.state_attr, len(args.infile))
-            for file_path, state in zip(args.infile, attrs, strict=False):
-                geometries = _read_geometries(file_path)
-                for frame_index, geometry in enumerate(geometries):
-                    label = file_path if len(geometries) == 1 else f"{file_path}[{frame_index}]"
-                    kwargs = {}
-                    if isinstance(geometry, Molecule):
-                        kwargs["graph_converter"] = _molecule_graph_converter(model)
-                    value = model.predict_structure(geometry, torch.tensor(state), **kwargs)  # type:ignore[operator]
-                    print(f"{args.model} prediction for {label} with {state_dict[state]} bandgap: {value} eV.")
-        else:
-            for file_path in args.infile:
-                geometries = _read_geometries(file_path)
-                for frame_index, geometry in enumerate(geometries):
-                    label = file_path if len(geometries) == 1 else f"{file_path}[{frame_index}]"
-                    kwargs = {}
-                    if isinstance(geometry, Molecule):
-                        kwargs["graph_converter"] = _molecule_graph_converter(model)
-                    value = model.predict_structure(geometry, **kwargs)  # type:ignore[operator]
-                    print(f"{args.model} prediction for {label}: {value} eV/atom.")
+        for file_path in args.infile:
+            geometries = _read_geometries(file_path)
+            for frame_index, geometry in enumerate(geometries):
+                label = file_path if len(geometries) == 1 else f"{file_path}[{frame_index}]"
+                kwargs = {}
+                if isinstance(geometry, Molecule):
+                    kwargs["graph_converter"] = _molecule_graph_converter(model)
+                value = model.predict_structure(geometry, **kwargs)  # type:ignore[operator]
+                print(f"{args.model} prediction for {label}: {value} eV/atom.")
     if args.mpids:
         # Lazy import: ``MPRester`` lives in the full ``pymatgen`` package which is
         # an optional dep (only ``pymatgen-core`` is required at install time).
@@ -286,7 +265,7 @@ def molecular_dynamics(args: argparse.Namespace) -> int:
                 atoms,
                 potential=potential,
                 ensemble=args.ensemble,
-                pressure=args.pressure,
+                pressure=args.pressure * units.bar,
                 timestep=args.stepsize,
                 trajectory=name + ".traj",
                 logfile=name + ".log",
@@ -358,7 +337,7 @@ def train_potential(args: argparse.Namespace) -> int:
     if any(value <= 0 for value in fractions) or not np.isclose(sum(fractions), 1.0):
         raise ValueError("train, validation, and test ratios must be positive and sum to 1")
 
-    architecture_names = {"CHGNet", "GRACE", "M3GNet", "MEGNet", "QET", "SO3Net", "TensorNet"}
+    architecture_names = {"CHGNet", "M3GNet", "MEGNet", "QET", "SO3Net", "TensorNet"}
     model_source = args.path_load_model or args.model
     is_scratch = model_source in architecture_names
 
@@ -665,14 +644,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p_predict.add_argument(
-        "-s",
-        "--state",
-        dest="state_attr",
-        nargs="+",
-        help="state attributes containing label. This should be an integer.",
-    )
-
-    p_predict.add_argument(
         "-m",
         "--model",
         dest="model",
@@ -783,7 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="ttime",
         type=float,
         default=25.0,
-        help="Characteristic timescale of the thermostat in ASE internal units. Default is 25.0.",
+        help="Characteristic timescale of the thermostat for npt_nose_hoover in fs. Default is 25.0.",
     )
 
     p_md.add_argument(
@@ -791,7 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="pfactor",
         type=float,
         default=75.0**2.0,
-        help="A constant in the barostat differential equation. Default is 25.0 in eV/A$^{3}$.",
+        help="A constant in the barostat differential equation for npt_nose_hoover. Default is 75.0**2.",
     )
 
     p_md.add_argument(
@@ -807,7 +778,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="compressibility_au",
         type=float,
         default=None,
-        help="Compressibility of the material in eV/A^{3}. Default is None.",
+        help="Compressibility of the material in A^{3}/eV. Required for npt and npt_berendsen. Default is None.",
     )
 
     p_md.add_argument(

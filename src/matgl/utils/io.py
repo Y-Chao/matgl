@@ -16,6 +16,7 @@ from typing import cast
 import numpy as np
 import torch
 from huggingface_hub import HfApi, create_repo, hf_hub_download
+from monty.json import MSONable
 from numpy._core.multiarray import _reconstruct as _np_reconstruct
 
 from matgl.config import MATGL_CACHE
@@ -47,6 +48,35 @@ torch.serialization.add_safe_globals(
         np.dtypes.Int64DType,
     ]
 )
+
+
+# Buffers that older checkpoints still carry but current code derives instead (``AtomRef.onehot``
+# was an identity-matrix cache, removed in #783). Ignored when reporting unexpected keys.
+_BENIGN_UNEXPECTED_SUFFIXES = (".onehot",)
+
+
+def _check_state_dict_keys(model: torch.nn.Module, missing: list[str], unexpected: list[str]) -> None:
+    """Fail loudly when a checkpoint does not match the model it is loaded into.
+
+    ``load_state_dict(strict=False)`` silently skips mismatched keys, which leaves the affected
+    parameters at their random initialization (e.g. a renamed submodule). Missing *parameters* are
+    therefore an error. Missing buffers are allowed, since they are rebuilt from the constructor
+    arguments (e.g. cutoffs), and unexpected keys are logged.
+
+    Raises:
+        RuntimeError: If any model parameter was not present in the checkpoint.
+    """
+    param_names = {name for name, _ in model.named_parameters()}
+    missing_params = sorted(k for k in missing if k in param_names)
+    if missing_params:
+        raise RuntimeError(
+            f"Checkpoint is incompatible with {type(model).__name__}: {len(missing_params)} parameter(s) "
+            f"would be left randomly initialized, e.g. {missing_params[:5]}. The checkpoint was likely "
+            "saved by an older, incompatible version of matgl."
+        )
+    stale = sorted(k for k in unexpected if not k.endswith(_BENIGN_UNEXPECTED_SUFFIXES))
+    if stale:
+        logger.warning("Ignoring %d unexpected key(s) in checkpoint, e.g. %s", len(stale), stale[:5])
 
 
 def _resolve_module(modname: str) -> str:
@@ -88,6 +118,10 @@ class IOMixIn:
     implements and supports PyTorch's state_dict and load_state_dict methods.
     """
 
+    # IOMixIn modules can be submodules of TorchScript-compiled models (e.g. ``BondExpansion`` in the LAMMPS export);
+    # keep TorchScript from compiling this Python-only property.
+    __jit_unused_properties__ = ["num_parameters"]  # noqa: RUF012
+
     def save_args(self, locals: dict, kwargs: dict | None = None) -> None:
         """Save the arguments passed to the class initializer.
 
@@ -112,7 +146,8 @@ class IOMixIn:
         if kwargs is not None:
             d.update(kwargs)
 
-        # If one of the args is a subclass of IOMixIn, we will serialize that class.
+        # If one of the args is a subclass of IOMixIn, we will serialize that class. Other MSONable args (e.g. target
+        # transformers) are stored via ``as_dict()``, since ``load`` only unpickles tensors and plain containers.
         for k, v in d.items():
             if issubclass(v.__class__, IOMixIn):
                 d[k] = {
@@ -121,6 +156,8 @@ class IOMixIn:
                     "@model_version": getattr(v, "__version__", 0),
                     "init_args": v._init_args,
                 }
+            elif isinstance(v, MSONable):
+                d[k] = v.as_dict()
         self._init_args = d
 
     def save(self, path: str | Path = ".", metadata: dict | None = None, makedirs: bool = True):
@@ -207,11 +244,17 @@ class IOMixIn:
                 classname = v["@class"]
                 mod = __import__(modname, globals(), locals(), [classname], 0)
                 cls_ = getattr(mod, classname)
-                _check_ver(cls_, v)  # Check version of any subclasses too.
-                d[k] = cls_(**v["init_args"])
+                if "init_args" in v:  # IOMixIn subclass
+                    _check_ver(cls_, v)  # Check version of any subclasses too.
+                    d[k] = cls_(**v["init_args"])
+                elif isinstance(cls_, type) and issubclass(cls_, MSONable):
+                    d[k] = cast("type[MSONable]", cls_).from_dict(v)
+                else:
+                    raise ValueError(f"Cannot deserialize argument {k!r} of unsupported type {modname}.{classname}.")
         d = {k: v for k, v in d.items() if not k.startswith("@")}
         model = cls(**d)
-        model.load_state_dict(state, strict=False)  # type: ignore
+        result = model.load_state_dict(state, strict=False)  # type: ignore
+        _check_state_dict_keys(model, result.missing_keys, result.unexpected_keys)  # type: ignore[arg-type]
         return model
 
     def push_to_hub(

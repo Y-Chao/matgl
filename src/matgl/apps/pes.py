@@ -16,6 +16,7 @@ from torch.autograd import grad
 from torch_geometric.data import Batch, Data
 
 import matgl
+from matgl.graph._compute import compute_pair_vector_and_distance
 from matgl.layers._atom_ref import AtomRef
 from matgl.layers._zbl import NuclearRepulsion
 from matgl.utils.constants import EV_PER_ANG3_TO_GPA
@@ -38,7 +39,8 @@ class Potential(nn.Module, IOMixIn):
     additionally ``total_charge`` and ``ext_pot``), and return a scalar
     energy tensor of shape ``(num_graphs,)``.
 
-    Outputs are denormalised with ``data_std * E_pred + data_mean`` and,
+    Outputs are denormalised with ``data_std * E_pred + data_mean``, where
+    ``data_mean`` is added once per structure, independent of its atom count, and,
     if ``element_refs`` is supplied, shifted by a per-atomic-number
     reference summed over the structure (see :class:`AtomRef`). The ZBL
     repulsion (:class:`NuclearRepulsion`) is optionally added when
@@ -91,8 +93,9 @@ class Potential(nn.Module, IOMixIn):
 
         Args:
             model: Model for predicting energies.
-            data_mean: Mean of target.
-            data_std: Std dev of target.
+            data_mean: Constant energy offset added once per structure (not per atom).
+                Use 0.0 to preserve extensivity; supply per-element energy offsets via element_refs.
+            data_std: Multiplicative scale on the predicted total energy and its derivatives.
             element_refs: Element reference values for each element, shape ``(n_elements,)``, or
                 ``(n_states, n_elements)`` for per-fidelity references, in which case the row is picked per graph
                 from the integer ``state_attr`` passed to ``forward``.
@@ -261,6 +264,18 @@ class Potential(nn.Module, IOMixIn):
             if l_g is not None:
                 l_g = l_g.to(device)
 
+        # Converters build float inputs as ``matgl.float_th``; follow the model's dtype
+        # instead so ``potential.double()`` works without a global ``set_default_dtype``.
+        dtype = self.data_mean.dtype
+        if lat.dtype != dtype:
+            lat = lat.to(dtype)
+        for key in ("frac_coords", "pbc_offset"):
+            value = getattr(g, key, None)
+            if isinstance(value, torch.Tensor) and value.is_floating_point() and value.dtype != dtype:
+                setattr(g, key, value.to(dtype))
+        if isinstance(state_attr, torch.Tensor) and state_attr.is_floating_point() and state_attr.dtype != dtype:
+            state_attr = state_attr.to(dtype)
+
         batch_size = g.num_graphs if hasattr(g, "num_graphs") else 1
         # st (strain) for stress calculations
         st = lat.new_zeros([batch_size, 3, 3])
@@ -309,6 +324,9 @@ class Potential(nn.Module, IOMixIn):
             total_energies = self.data_std * total_energies + self.data_mean
 
             if self.calc_repuls:
+                # Recompute distances from the strained, grad-tracked positions so the ZBL term
+                # contributes to forces and stresses, not only to the energy.
+                _, g.bond_dist = compute_pair_vector_and_distance(g.pos, g.edge_index, g.pbc_offshift)
                 total_energies += self.repuls(self.model.element_types, g)  # type: ignore[attr-defined]
 
             if self.element_refs is not None:

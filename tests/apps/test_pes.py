@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 
 import numpy as np
@@ -11,6 +12,7 @@ from torch_geometric.data import Batch
 import matgl
 from matgl.apps.pes import Potential
 from matgl.ext.pymatgen import Structure2Graph, get_element_list
+from matgl.models import CHGNet, M3GNet
 from matgl.models._tensornet import TensorNet
 
 
@@ -142,6 +144,24 @@ class TestPotential:
         fd = (e_plus - e_minus) / (2 * 0.01)
         assert np.allclose(fd.detach().numpy(), grad_dx_zero[0][0].detach().numpy(), atol=1e-05)
 
+    def test_repulsion_contributes_forces_and_stresses(self, model_tensornet):
+        """ZBL must be differentiated w.r.t. positions and strain, on graphs straight from the converter."""
+        p2g = Structure2Graph(element_types=("Mo", "S"), cutoff=5.0)
+        delta = 0.002
+        structs = [
+            Structure(Lattice.cubic(6.0), ["Mo", "S"], [[0, 0, 0], [0.25 + dx, 0.0, 0.0]]) for dx in (-delta, 0, delta)
+        ]
+        graphs = [p2g.get_graph(s) for s in structs]
+        torch.manual_seed(0)
+        ff = Potential(model=model_tensornet, calc_repuls=True, debug_mode=True).double()
+        ff_no_repuls = Potential(model=model_tensornet, debug_mode=True).double()
+        (e_minus, _, _), (_, de_dx, de_deps), (e_plus, _, _) = [ff(g, lat, state) for g, lat, state in graphs]
+        fd = (e_plus - e_minus) / (2 * delta * 6.0)
+        np.testing.assert_allclose(de_dx[1][0].item(), fd.item(), rtol=1e-3)
+        _, de_dx_no_repuls, de_deps_no_repuls = ff_no_repuls(*graphs[1])
+        assert not torch.allclose(de_dx, de_dx_no_repuls)
+        assert not torch.allclose(de_deps, de_deps_no_repuls)
+
     def test_forward_does_not_mutate_input_graph(self, graph_MoS, model_tensornet):
         """``Potential.forward`` must shallow-clone ``g`` so the caller's graph keeps
         its original attribute set and ``frac_coords``/``edge_index`` tensors are
@@ -156,6 +176,21 @@ class TestPotential:
         assert fields_before == fields_after, (
             f"Potential.forward mutated input graph; added: {fields_after - fields_before}"
         )
+
+    @pytest.mark.parametrize("model_cls", [TensorNet, M3GNet, CHGNet])
+    def test_double_precision_with_float32_inputs(self, graph_MoS, model_cls):
+        """``Potential.double()`` must work on converter (``matgl.float_th``) inputs and agree with float32."""
+        structure, graph, state = graph_MoS
+        lat = torch.tensor(structure.lattice.matrix, dtype=matgl.float_th)
+        torch.manual_seed(0)
+        ff32 = Potential(model=model_cls(element_types=["Mo", "S"], is_intensive=False))
+        ff64 = copy.deepcopy(ff32).double()
+        out32 = ff32(graph, lat, state)
+        out64 = ff64(graph, lat, state)
+        assert graph.frac_coords.dtype == matgl.float_th, "forward must not mutate the caller's graph"
+        for actual, expected in zip(out64[:3], out32[:3], strict=True):
+            assert actual.dtype == torch.float64
+            np.testing.assert_allclose(actual.detach().numpy(), expected.detach().numpy(), rtol=1e-4, atol=1e-4)
 
     def test_potential_with_stress_fd(self, graph_MoS, model_tensornet):
         p2g = Structure2Graph(element_types=("O", "Zr"), cutoff=5.0)
@@ -221,3 +256,26 @@ def test_potential_per_fidelity_element_refs_mixed_batch(MoS):
     counts = torch.tensor([float(MoS.composition[el]) for el in element_types], dtype=matgl.float_th)
     assert e.shape == (2,)
     assert torch.allclose(e - e_noref, refs @ counts, atol=1e-5)
+
+
+def test_energy_mean_is_per_structure_and_roundtrips(MoS, tmp_path):
+    """Pin the legacy per-structure offset without changing existing checkpoint energies (#862)."""
+    torch.manual_seed(0)
+    converter = Structure2Graph(element_types=("Mo", "S"), cutoff=5.0)
+    structures = [MoS, MoS * (2, 1, 1)]
+    converted = [converter.get_graph(structure) for structure in structures]
+    graph = Batch.from_data_list([item[0] for item in converted])
+    lattice = torch.cat([item[1] for item in converted])
+    model = TensorNet(element_types=("Mo", "S"), is_intensive=False, use_warp=False)
+    raw = Potential(model, calc_stresses=False)
+    shifted = Potential(model, data_mean=-5.0, data_std=2.5, calc_stresses=False)
+    raw_energy, raw_forces, *_ = raw(graph.clone(), lattice)
+    energy, forces, *_ = shifted(graph.clone(), lattice)
+    torch.testing.assert_close(energy, 2.5 * raw_energy - 5.0)
+    torch.testing.assert_close(forces, 2.5 * raw_forces)
+    assert (energy[1] - 2 * energy[0]).item() == pytest.approx(5.0, abs=1e-4)
+    shifted.save(tmp_path)
+    loaded = Potential.load(tmp_path)
+    loaded_energy, loaded_forces, *_ = loaded(graph.clone(), lattice)
+    torch.testing.assert_close(loaded_energy, energy)
+    torch.testing.assert_close(loaded_forces, forces)
